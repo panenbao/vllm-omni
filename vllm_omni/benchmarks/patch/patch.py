@@ -248,6 +248,7 @@ def get_samples(args, tokenizer):
         input_requests = dataset.sample(
             tokenizer=tokenizer,
             request_id_prefix=args.request_id_prefix,
+            num_requests=args.num_prompts,
             prefix_len=getattr(args, "servegen_prefix_len", 0),
         )
         logger.info("Loaded %d ServeGen requests", len(input_requests))
@@ -865,7 +866,7 @@ async def benchmark(
             tasks.append(
                 asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
             )
-            logger.info(f"Send Request at {current_request_rate}")
+            # logger.info(f"Send Request at {current_request_rate}")
     else: 
         async for request, current_request_rate in get_request(
             input_requests,

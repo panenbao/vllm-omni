@@ -221,25 +221,27 @@ class ServeGenDataSet(OmniRandomMultiModalDataset):
         prefix_token_ids=self.get_prefix(tokenizer,allowed_tokens,prefix_len)
         token_mismatch_total=0
         for i,item in enumerate(self.data[:num_requests]):
+            input_len=int(self.data[i].get("text_tokens",self.data[i].get("input_tokens",0)))
             prompt,total_input_len,token_mismatch=self.generate_token_sequence(
                 tokenizer=tokenizer,
                 prefix_token_ids=prefix_token_ids,
                 prefix_len=prefix_len,
                 vocab_size=vocab_size,
-                input_len=self.data[i]["text_tokens"],
+                input_len=input_len,
                 offset=0,
                 index=i,
                 allowed_tokens=allowed_tokens,
             )
             token_mismatch_total+=token_mismatch
             mm_item_list=[]
-            for mm in self.data[i]["mm_items"]:
-                if mm["modality"] == "image":
-                    mm_item_list.append(self.generate_mm_item((mm["h"],mm["w"],1)))
-                elif mm["modality"] == "video":
-                    mm_item_list.append(self.generate_mm_item((mm["h"],mm["w"],int(mm["t"]*mm["fps"]))))
-                elif mm["modality"] == "audio":
-                    mm_item_list.append(self.generate_mm_item((0,mm["duration_s"],mm["num_channels"])))
+            if("mm_items"  in self.data[i]):
+                for mm in self.data[i]["mm_items"]:
+                    if mm["modality"] == "image":
+                        mm_item_list.append(self.generate_mm_item((mm["h"],mm["w"],1)))
+                    elif mm["modality"] == "video":
+                        mm_item_list.append(self.generate_mm_item((mm["h"],mm["w"],int(mm["t"]*mm["fps"]))))
+                    elif mm["modality"] == "audio":
+                        mm_item_list.append(self.generate_mm_item((0,mm["duration_s"],mm["num_channels"])))
             sample_request=ServeGenSampleRequest(
                 prompt=prompt,
                 prompt_len=total_input_len,
