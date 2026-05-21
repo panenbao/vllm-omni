@@ -11,9 +11,10 @@ import traceback
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from typing import AsyncGenerator, Literal
 
 import aiohttp
+import pandas as pd
 import pybase64 as base64
 from pydub import AudioSegment
 from tqdm.asyncio import tqdm
@@ -36,7 +37,7 @@ from vllm.tokenizers import TokenizerLike
 logger = init_logger(__name__)
 
 from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset, DailyOmniSampleRequest
-from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
+from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset,ServeGenDataSet,ServeGenSampleRequest
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
     SeedTTSDataset,
@@ -142,8 +143,9 @@ def get_samples(args, tokenizer):
     # Check if we need to handle omni-related backends/datasets
     is_omni_backend = args.backend in ["openai-chat-omni", "openai-audio-speech", "daily-omni"]
     is_omni_dataset = is_daily_omni or is_seed_tts or args.dataset_name == "random-mm"
+    is_servegen = args.dataset_name == "servegen"
 
-    if not is_omni_backend and not is_omni_dataset:
+    if not is_omni_backend and not is_omni_dataset and not is_servegen:
         # Not an omni-related request, delegate to original implementation
         return get_samples_old(args, tokenizer)
 
@@ -189,6 +191,7 @@ def get_samples(args, tokenizer):
                 trust_remote_code=getattr(args, "trust_remote_code", False),
                 disable_shuffle=getattr(args, "disable_shuffle", False),
             )
+        
         else:
             repo_id = _daily_omni_repo_from_args(args)
             if args.dataset_name == "daily-omni":
@@ -235,7 +238,20 @@ def get_samples(args, tokenizer):
             no_oversample=args.no_oversample,
         )
         return input_requests
-
+    if is_servegen:
+        logger.info("Loading ServeGen dataset for generation benchmarking")
+        dataset=ServeGenDataSet(
+            dataset_path=getattr(args, "dataset_path", None),
+            random_seed=args.seed,
+            disable_shuffle=True,
+        )
+        input_requests = dataset.sample(
+            tokenizer=tokenizer,
+            request_id_prefix=args.request_id_prefix,
+            prefix_len=getattr(args, "servegen_prefix_len", 0),
+        )
+        logger.info("Loaded %d ServeGen requests", len(input_requests))
+        return input_requests
     if is_seed_tts:
         if args.backend not in ("openai-audio-speech", "openai-chat-omni"):
             raise ValueError(
@@ -301,7 +317,6 @@ def get_samples(args, tokenizer):
 
 
 datasets.get_samples = get_samples
-
 _serve_mod = sys.modules.get("vllm.benchmarks.serve")
 if _serve_mod is not None:
     _serve_mod.get_samples = get_samples
@@ -813,35 +828,27 @@ async def benchmark(
                 "timestamp": datetime.now().isoformat(),
             }
         )
-
-    async for request, current_request_rate in get_request(
-        input_requests,
-        request_rate,
-        burstiness,
-        ramp_up_strategy,
-        ramp_up_start_rps,
-        ramp_up_end_rps,
-    ):
-        if ramp_up_strategy is not None:
-            current_int_rps = int(current_request_rate)
-            if current_int_rps > last_int_rps:
-                timestamp = datetime.now().isoformat()
-                for rps_val in range(last_int_rps + 1, current_int_rps + 1):
-                    rps_change_events.append({"rps": rps_val, "timestamp": timestamp})
-                last_int_rps = current_int_rps
-        prompt, prompt_len, output_len, mm_content, request_id = (
+    if isinstance(input_requests[0], ServeGenSampleRequest):
+        async for request, current_request_rate in servegen_get_requests(
+            list[ServeGenSampleRequest](input_requests),
+            request_rate,
+            burstiness,
+            ramp_up_strategy,
+            ramp_up_start_rps,
+            ramp_up_end_rps,
+        ):
+            prompt, prompt_len, output_len, mm_content, request_id = (
             request.prompt,
             request.prompt_len,
             request.expected_output_len,
             request.multi_modal_data,
             request.request_id,
         )
-        req_model_id, req_model_name = model_id, model_name
-        if lora_modules:
-            req_lora_module = next(lora_modules)
-            req_model_id, req_model_name = req_lora_module, req_lora_module
-
-        request_func_input = RequestFuncInput(
+            req_model_id, req_model_name = model_id, model_name
+            if lora_modules:
+                req_lora_module = next(lora_modules)
+                req_model_id, req_model_name = req_lora_module, req_lora_module
+            request_func_input = RequestFuncInput(
             model=req_model_id,
             model_name=req_model_name,
             prompt=prompt,
@@ -854,12 +861,58 @@ async def benchmark(
             extra_headers=extra_headers,
             extra_body=extra_body,
             request_id=request_id,
-        )
-        _attach_daily_omni_to_request_func_input(request, request_func_input)
-        _attach_seed_tts_to_request_func_input(request, request_func_input)
-        tasks.append(
-            asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
-        )
+            )
+            tasks.append(
+                asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
+            )
+            logger.info(f"Send Request at {current_request_rate}")
+    else: 
+        async for request, current_request_rate in get_request(
+            input_requests,
+            request_rate,
+            burstiness,
+            ramp_up_strategy,
+            ramp_up_start_rps,
+            ramp_up_end_rps,
+        ):
+            if ramp_up_strategy is not None:
+                current_int_rps = int(current_request_rate)
+                if current_int_rps > last_int_rps:
+                    timestamp = datetime.now().isoformat()
+                    for rps_val in range(last_int_rps + 1, current_int_rps + 1):
+                        rps_change_events.append({"rps": rps_val, "timestamp": timestamp})
+                    last_int_rps = current_int_rps
+            prompt, prompt_len, output_len, mm_content, request_id = (
+                request.prompt,
+                request.prompt_len,
+                request.expected_output_len,
+                request.multi_modal_data,
+                request.request_id,
+            )
+            req_model_id, req_model_name = model_id, model_name
+            if lora_modules:
+                req_lora_module = next(lora_modules)
+                req_model_id, req_model_name = req_lora_module, req_lora_module
+
+            request_func_input = RequestFuncInput(
+                model=req_model_id,
+                model_name=req_model_name,
+                prompt=prompt,
+                api_url=api_url,
+                prompt_len=prompt_len,
+                output_len=output_len,
+                logprobs=logprobs,
+                multi_modal_content=mm_content,
+                ignore_eos=ignore_eos,
+                extra_headers=extra_headers,
+                extra_body=extra_body,
+                request_id=request_id,
+            )
+            _attach_daily_omni_to_request_func_input(request, request_func_input)
+            _attach_seed_tts_to_request_func_input(request, request_func_input)
+            tasks.append(
+                asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
+            )
     outputs: list[MixRequestFuncOutput] = await asyncio.gather(*tasks)
 
     if pbar is not None:
@@ -1007,6 +1060,30 @@ async def benchmark(
 
     await session.close()
     return result
+async def servegen_get_requests(
+    input_requests: list[ServeGenSampleRequest],
+    request_rate: float,
+    burstiness: float = 1.0,
+    ramp_up_strategy: Literal["linear", "exponential"] | None = None,
+    ramp_up_start_rps: int | None = None,
+    ramp_up_end_rps: int | None = None,
+) -> AsyncGenerator[tuple[ServeGenSampleRequest, float], None]:
+    if isinstance(input_requests, Iterable) and not isinstance(input_requests, list):
+        input_requests = list(input_requests)
+    total_requests = len(input_requests)
+    delay_ts = []
+    assert total_requests > 0, "No requests provided."
+    for i, request in enumerate(input_requests):
+        delay_ts.append(float(request.time_stamp))
+    start_ts=time.time()
+    for request_index,request in enumerate(input_requests):
+        if(delay_ts[request_index]>0):
+            current_ts = time.time()
+            sleep_interval_s = start_ts + delay_ts[request_index] - current_ts
+            if sleep_interval_s > 0:
+                await asyncio.sleep(sleep_interval_s)
+        yield request, time.time() - start_ts
+
 
 
 serve.benchmark = benchmark
