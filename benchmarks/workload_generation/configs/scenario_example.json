@@ -1,0 +1,39 @@
+{
+  "$comment": "Example multi-window scenario: warmup at 5 req/s for 30s, then burst to 25 req/s for 30s. Mostly text with 60% one-image, 20% no-image, 20% two-image.",
+  "category": "multimodal",
+  "duration": 60,
+  "seed": 42,
+  "output": "workload/multi_window_demo.csv",
+  "rate_schedule": {"0": 5.0, "30": 25.0},
+  "clients": [
+    {
+      "client_id": 0,
+      "windows": {
+        "0":  {"rate": 5.0,  "cv": 1.5, "pat": "Gamma", "pat_shape": 0.5, "pat_scale": 1.0},
+        "30": {"rate": 25.0, "cv": 2.0, "pat": "Gamma", "pat_shape": 0.5, "pat_scale": 1.0}
+      },
+      "fields": {
+        "0": {
+          "text_tokens":   {"dist": "normal", "loc": 500,  "scale": 100, "max": 1500},
+          "output_tokens": {"dist": "exponential", "loc": 0, "scale": 100, "max": 1000},
+          "image_tokens":  {"dist": "normal", "loc": 700, "scale": 100, "max": 1500},
+          "image_count":   {"dist": "categorical", "probs": [0.2, 0.6, 0.2]},
+          "audio_tokens":  {"dist": "fixed", "loc": 0, "max": 1},
+          "audio_count":   {"dist": "fixed", "loc": 0, "max": 1},
+          "video_tokens":  {"dist": "fixed", "loc": 0, "max": 1},
+          "video_count":   {"dist": "fixed", "loc": 0, "max": 1}
+        },
+        "30": {
+          "text_tokens":   {"dist": "normal", "loc": 1500, "scale": 300, "max": 3000},
+          "output_tokens": {"dist": "exponential", "loc": 0, "scale": 200, "max": 2000},
+          "image_tokens":  {"dist": "normal", "loc": 1000, "scale": 200, "max": 2000},
+          "image_count":   {"dist": "categorical", "probs": [0.0, 0.5, 0.5]},
+          "audio_tokens":  {"dist": "fixed", "loc": 0, "max": 1},
+          "audio_count":   {"dist": "fixed", "loc": 0, "max": 1},
+          "video_tokens":  {"dist": "fixed", "loc": 0, "max": 1},
+          "video_count":   {"dist": "fixed", "loc": 0, "max": 1}
+        }
+      }
+    }
+  ]
+}
