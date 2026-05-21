@@ -480,10 +480,11 @@ class Orchestrator:
                                     "new_prompt_len_snapshot",
                                     None,
                                 )
-                            now = _time.monotonic()
-                            record_stats = (
-                                self._stat_logger is not None and now - self._last_stats_ts >= self._stats_interval_s
-                            )
+                            # now = _time.monotonic()
+                            # record_stats = (
+                            #     self._stat_logger is not None and now - self._last_stats_ts >= self._stats_interval_s
+                            # )
+                            record_stats = self._stat_logger is not None
                             iteration_stats = IterationStats() if record_stats else None
                             raw_output = await pool.process_llm_raw_outputs(
                                 replica_id,
@@ -491,7 +492,7 @@ class Orchestrator:
                                 iteration_stats=iteration_stats,
                             )
                             if record_stats:
-                                self._last_stats_ts = now
+                                # self._last_stats_ts = now
                                 self._stat_logger.record(
                                     raw_outputs.scheduler_stats,
                                     iteration_stats,
