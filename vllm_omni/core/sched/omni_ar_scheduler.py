@@ -190,59 +190,60 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return False
 
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
-        if self.chunk_transfer_adapter:
-            self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
-
-        try:
-            scheduler_output = super().schedule()
-        finally:
+        with nvtx_range("OmniARScheduler_schedule"):
             if self.chunk_transfer_adapter:
-                # Add request waiting for chunk to the waiting and running queue
-                self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
-        try:
-            # Late import to avoid circulars in some launch modes
-            from .output import OmniNewRequestData
+                self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
 
-            # Rewrap base NewRequestData entries with OmniNewRequestData,
-            # enriching with request-level payloads
-            new_list = []
-            for nr in scheduler_output.scheduled_new_reqs:
-                req_id = getattr(nr, "req_id", None)
-                request = self.requests.get(req_id) if req_id else None
-                # Build omni entry preserving all base fields
-                omni_nr = OmniNewRequestData(
-                    req_id=nr.req_id,
-                    external_req_id=(getattr(request, "external_req_id", None) if request else None),
-                    prompt_token_ids=nr.prompt_token_ids,
-                    mm_features=nr.mm_features,
-                    sampling_params=nr.sampling_params,
-                    pooling_params=nr.pooling_params,
-                    block_ids=nr.block_ids,
-                    num_computed_tokens=nr.num_computed_tokens,
-                    lora_request=nr.lora_request,
-                    # Enrich with omni payloads from the live request object
-                    prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
-                    additional_information=(getattr(request, "additional_information", None) if request else None),
-                )
-                new_list.append(omni_nr)
+            try:
+                scheduler_output = super().schedule()
+            finally:
+                if self.chunk_transfer_adapter:
+                    # Add request waiting for chunk to the waiting and running queue
+                    self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+            try:
+                # Late import to avoid circulars in some launch modes
+                from .output import OmniNewRequestData
 
-            scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
-            if self.chunk_transfer_adapter:
-                self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output, self.requests)
-            # Add information about requests needing KV cache transfer
-            finished_reqs = self.get_finished_requests_needing_kv_transfer()
-        except Exception:
-            # If anything goes wrong, leave the original output unchanged
-            init_logger(__name__).exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
-            finished_reqs = {}
+                # Rewrap base NewRequestData entries with OmniNewRequestData,
+                # enriching with request-level payloads
+                new_list = []
+                for nr in scheduler_output.scheduled_new_reqs:
+                    req_id = getattr(nr, "req_id", None)
+                    request = self.requests.get(req_id) if req_id else None
+                    # Build omni entry preserving all base fields
+                    omni_nr = OmniNewRequestData(
+                        req_id=nr.req_id,
+                        external_req_id=(getattr(request, "external_req_id", None) if request else None),
+                        prompt_token_ids=nr.prompt_token_ids,
+                        mm_features=nr.mm_features,
+                        sampling_params=nr.sampling_params,
+                        pooling_params=nr.pooling_params,
+                        block_ids=nr.block_ids,
+                        num_computed_tokens=nr.num_computed_tokens,
+                        lora_request=nr.lora_request,
+                        # Enrich with omni payloads from the live request object
+                        prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
+                        additional_information=(getattr(request, "additional_information", None) if request else None),
+                    )
+                    new_list.append(omni_nr)
 
-        # Wrap in omni scheduler output to carry transfer metadata.
-        base_fields = SchedulerOutput.__dataclass_fields__.keys()
-        base_data = {name: getattr(scheduler_output, name) for name in base_fields}
-        return OmniSchedulerOutput(
-            **base_data,
-            finished_requests_needing_kv_transfer=finished_reqs,
-        )
+                scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
+                if self.chunk_transfer_adapter:
+                    self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output, self.requests)
+                # Add information about requests needing KV cache transfer
+                finished_reqs = self.get_finished_requests_needing_kv_transfer()
+            except Exception:
+                # If anything goes wrong, leave the original output unchanged
+                init_logger(__name__).exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
+                finished_reqs = {}
+
+            # Wrap in omni scheduler output to carry transfer metadata.
+            base_fields = SchedulerOutput.__dataclass_fields__.keys()
+            base_data = {name: getattr(scheduler_output, name) for name in base_fields}
+            return OmniSchedulerOutput(
+                **base_data,
+                finished_requests_needing_kv_transfer=finished_reqs,
+            )
 
     def update_from_output(
         self,
@@ -439,7 +440,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     )
                 )
                 if self.chunk_transfer_adapter is not None:
-                    self.chunk_transfer_adapter.save_async(pooler_output, request)
+                    with nvtx_range("OmniARScheduler_save_async"):
+                        self.chunk_transfer_adapter.save_async(pooler_output, request)
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors

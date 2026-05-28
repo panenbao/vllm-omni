@@ -813,7 +813,7 @@ async def benchmark(
                 "timestamp": datetime.now().isoformat(),
             }
         )
-
+    req_cnt=0
     async for request, current_request_rate in get_request(
         input_requests,
         request_rate,
@@ -855,6 +855,11 @@ async def benchmark(
             extra_body=extra_body,
             request_id=request_id,
         )
+        if req_cnt%2==0:
+            request_func_input.extra_body["modalities"] = ["text","audio"]
+        else:
+            request_func_input.extra_body["modalities"] = ["text","audio"]
+        req_cnt+=1
         _attach_daily_omni_to_request_func_input(request, request_func_input)
         _attach_seed_tts_to_request_func_input(request, request_func_input)
         tasks.append(

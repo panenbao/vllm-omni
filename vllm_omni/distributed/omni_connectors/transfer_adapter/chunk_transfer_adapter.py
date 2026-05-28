@@ -14,6 +14,7 @@ from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec
 from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
+from vllm_omni.utils.nvtx import nvtx_range,nvtx_mark
 
 logger = get_connector_logger(__name__)
 
@@ -222,59 +223,60 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return payload_data
 
     def _send_single_request(self, task: dict):
-        raw_po = task["pooling_output"]
-        pooling_output = unflatten_payload(raw_po) if isinstance(raw_po, dict) else raw_po
-        request = task["request"]
-        is_finished = task["is_finished"]
-        stage_id = self.connector.stage_id
-        next_stage_id = stage_id + 1
-        external_req_id = request.external_req_id
-        chunk_id = self.put_req_chunk[external_req_id]
-        connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
-        # Process payload in save_loop thread
-        payload_data = None
-        if self.custom_process_next_stage_input_func:
-            try:
-                payload_data = self.custom_process_next_stage_input_func(
-                    transfer_manager=self,
-                    pooling_output=pooling_output,
-                    request=request,
-                    is_finished=is_finished,
-                )
+        with nvtx_range("ChunkTransferAdapter._send_single_request"):
+            raw_po = task["pooling_output"]
+            pooling_output = unflatten_payload(raw_po) if isinstance(raw_po, dict) else raw_po
+            request = task["request"]
+            is_finished = task["is_finished"]
+            stage_id = self.connector.stage_id
+            next_stage_id = stage_id + 1
+            external_req_id = request.external_req_id
+            chunk_id = self.put_req_chunk[external_req_id]
+            connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
+            # Process payload in save_loop thread
+            payload_data = None
+            if self.custom_process_next_stage_input_func:
+                try:
+                    payload_data = self.custom_process_next_stage_input_func(
+                        transfer_manager=self,
+                        pooling_output=pooling_output,
+                        request=request,
+                        is_finished=is_finished,
+                    )
 
-            except Exception as e:
-                logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
+                except Exception as e:
+                    logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
 
-        if not payload_data:
-            return
+            if not payload_data:
+                return
 
-        success, size, metadata = self.connector.put(
-            from_stage=str(stage_id),
-            to_stage=str(next_stage_id),
-            put_key=connector_put_key,
-            data=payload_data,
-        )
+            success, size, metadata = self.connector.put(
+                from_stage=str(stage_id),
+                to_stage=str(next_stage_id),
+                put_key=connector_put_key,
+                data=payload_data,
+            )
 
-        if success:
-            self.put_req_chunk[external_req_id] += 1
-            logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
-            finished_flag = payload_data.get("meta", {}).get("finished", payload_data.get("finished"))
-            is_payload_finished = False
-            if isinstance(finished_flag, torch.Tensor):
-                is_payload_finished = finished_flag.numel() == 1 and bool(finished_flag.item())
-            elif finished_flag is not None:
-                is_payload_finished = bool(finished_flag)
+            if success:
+                self.put_req_chunk[external_req_id] += 1
+                logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
+                finished_flag = payload_data.get("meta", {}).get("finished", payload_data.get("finished"))
+                is_payload_finished = False
+                if isinstance(finished_flag, torch.Tensor):
+                    is_payload_finished = finished_flag.numel() == 1 and bool(finished_flag.item())
+                elif finished_flag is not None:
+                    is_payload_finished = bool(finished_flag)
 
-            # Reclaim per-request async state only after the terminal payload
-            # has been sent successfully. This avoids cleanup->save races.
-            if is_payload_finished:
-                self.cleanup(request.request_id, external_req_id)
+                # Reclaim per-request async state only after the terminal payload
+                # has been sent successfully. This avoids cleanup->save races.
+                if is_payload_finished:
+                    self.cleanup(request.request_id, external_req_id)
 
-        if is_finished:
-            self.code_prompt_token_ids.pop(external_req_id, None)
-            cached_ic = getattr(self, "_cached_ic", None)
-            if cached_ic is not None:
-                cached_ic.pop(external_req_id, None)
+            if is_finished:
+                self.code_prompt_token_ids.pop(external_req_id, None)
+                cached_ic = getattr(self, "_cached_ic", None)
+                if cached_ic is not None:
+                    cached_ic.pop(external_req_id, None)
 
     ########################################################################
     # Cleanup
@@ -348,12 +350,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """
         if self.connector.stage_id == 0:
             return
-        self._process_chunk_queue(
-            waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
-        )
-        self._process_chunk_queue(
-            running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, self._finished_load_reqs
-        )
+        with nvtx_range("OmniChunkTransferAdapter_process_waiting_chunks"):
+            self._process_chunk_queue(
+                waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
+            )
+        with nvtx_range("OmniChunkTransferAdapter_process_running_chunks"):
+            self._process_chunk_queue(
+                running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, self._finished_load_reqs
+            )
         while len(running_queue) > self.scheduler_max_num_seqs:
             request = running_queue.pop()
             request.status = RequestStatus.PREEMPTED

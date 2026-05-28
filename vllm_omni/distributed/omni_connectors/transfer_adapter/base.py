@@ -6,6 +6,7 @@ from collections import deque
 from typing import Any
 
 from ..utils.logging import get_connector_logger
+from vllm_omni.utils.nvtx import nvtx_range, nvtx_mark
 
 logger = get_connector_logger(__name__)
 
@@ -76,11 +77,12 @@ class OmniTransferAdapterBase:
                     logger.warning(f"Error receiving data for {request_id}: {e}")
 
             # Timeout is the fallback for lock-free append/notify races.
-            with self._recv_cond:
-                if not self._pending_load_reqs and not self.stop_event.is_set():
-                    self._recv_cond.wait(timeout=0.1)
-                elif not any_success and not self.stop_event.is_set():
-                    self._recv_cond.wait(timeout=0.001)
+            with nvtx_range("OmniTransferAdapterBase_recv_loop_wait"):
+                with self._recv_cond:
+                    if not self._pending_load_reqs and not self.stop_event.is_set():
+                        self._recv_cond.wait(timeout=0.1)
+                    elif not any_success and not self.stop_event.is_set():
+                        self._recv_cond.wait(timeout=0.001)
 
     def save_loop(self):
         """Loop to send outgoing data."""
@@ -91,10 +93,10 @@ class OmniTransferAdapterBase:
                     self._send_single_request(task)
                 except Exception as e:
                     logger.warning(f"Error saving data for {task.get('request_id')}: {e}")
-
-            with self._save_cond:
-                if not self._pending_save_reqs and not self.stop_event.is_set():
-                    self._save_cond.wait(timeout=0.1)
+            with nvtx_range("OmniTransferAdapterBase_save_loop_wait"):
+                with self._save_cond:
+                    if not self._pending_save_reqs and not self.stop_event.is_set():
+                        self._save_cond.wait(timeout=0.1)
 
     def _poll_single_request(self, *args, **kwargs):
         """Poll connector for a single request task.

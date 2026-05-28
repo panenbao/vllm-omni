@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from pprint import pformat
 import sys
 import time
 import types
@@ -281,6 +282,8 @@ class OmniBase(PDDisaggregationMixin):
                 return
             if str(request_id) not in req_state.metrics.e2e_done:
                 self.prom_metrics.request_failed()
+            # summary = req_state.metrics.build_and_log_summary()
+            # logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
         except Exception:
             logger.exception(
                 "[%s] Failed to build/log summary for req=%s",
