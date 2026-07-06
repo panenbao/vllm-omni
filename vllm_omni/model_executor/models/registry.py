@@ -53,6 +53,12 @@ _OMNI_MODELS = {
         "qwen3_omni_code2wav",
         "Qwen3OmniMoeCode2Wav",
     ),
+    ## Qwen3-Omni-MoE Decoupled (5-stage)
+    "Qwen3OmniMoeDecoupledForConditionalGeneration": (
+        "qwen3_omni_decoupled",
+        "qwen3_omni_decoupled",
+        "Qwen3OmniMoeDecoupledForConditionalGeneration",
+    ),
     "CosyVoice3Model": (
         "cosyvoice3",
         "cosyvoice3",
