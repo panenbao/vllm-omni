@@ -37,6 +37,10 @@ stages:
     enable_prefix_caching: false
     devices: "0"
     engine_output_type: latent
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /home/MotivationExperiment/output/vllm_profile
+      torch_profiler_use_gzip: true
 
   # ══════════ Stage 1: Visual Encoder ══════════
   - stage_id: 1
@@ -51,6 +55,10 @@ stages:
     engine_output_type: latent
     input_connectors:
       from_stage_0: connector_of_shared_memory
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /home/MotivationExperiment/output/vllm_profile
+      torch_profiler_use_gzip: true
 
   # ══════════ Stage 2: Thinker LM ═════════════
   - stage_id: 2
@@ -67,6 +75,10 @@ stages:
     default_sampling_params:
       temperature: 0.0
       max_tokens: 2048
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /home/MotivationExperiment/output/vllm_profile
+      torch_profiler_use_gzip: true
 
   # ══════════ Stage 3: Talker ═════════════════
   - stage_id: 3
@@ -88,6 +100,10 @@ stages:
       max_tokens: 4096
       seed: 42
       repetition_penalty: 1.05
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /home/MotivationExperiment/output/vllm_profile
+      torch_profiler_use_gzip: true
 
   # ══════════ Stage 4: Code2Wav ═══════════════
   - stage_id: 4
@@ -113,6 +129,20 @@ stages:
       max_tokens: 65536
       seed: 42
       repetition_penalty: 1.1
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /home/MotivationExperiment/output/vllm_profile
+      torch_profiler_use_gzip: true
+      torch_profiler_record_shapes: true
+      torch_profiler_with_stack: true
+      torch_profiler_with_memory: true
+      torch_profiler_with_flops: false
+      torch_profiler_dump_cuda_time_total: false
+      delay_iterations: 0
+      max_iterations: 0
+      wait_iterations: 0
+      warmup_iterations: 0
+      active_iterations: 1
 
 platforms:
   npu:
