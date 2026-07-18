@@ -25,6 +25,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3MoeLLMForCausalLM,
 )
 from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+from vllm_omni.utils.nvtx import nvtx_range
 
 logger = init_logger(__name__)
 
@@ -252,19 +253,20 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
         """Forward pass through the talker model."""
-        if inputs_embeds is None and input_ids is not None:
-            inputs_embeds = self.embed_input_ids(input_ids)
-            input_ids = None
+        with nvtx_range("omni_decoupled_forward_talker"):
+            if inputs_embeds is None and input_ids is not None:
+                inputs_embeds = self.embed_input_ids(input_ids)
+                input_ids = None
 
-        talker_hidden_states, _ = self.language_model.model(
-            input_ids,
-            positions,
-            intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **kwargs,
-        )
+            talker_hidden_states, _ = self.language_model.model(
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **kwargs,
+            )
 
-        return talker_hidden_states
+            return talker_hidden_states
 
     def compute_logits(
         self,

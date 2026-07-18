@@ -36,6 +36,8 @@ _FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
     {
         ("Qwen3OmniMoeForConditionalGeneration", "talker"),
         ("Qwen3OmniMoeForConditionalGeneration", "code2wav"),
+        ("Qwen3OmniMoeDecoupledForConditionalGeneration", "visual_encoder"),
+        ("Qwen3OmniMoeDecoupledForConditionalGeneration", "thinker_lm"),
         # qwen2_5_omni thinker->talker uses the real full-payload
         # producer builder (text_hidden_states routed via
         # pooler_output["hidden"] -> accumulator -> connector).  Both

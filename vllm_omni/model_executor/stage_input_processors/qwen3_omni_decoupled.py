@@ -1,124 +1,84 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Stage input processors for decoupled Qwen3-Omni-MoE (5-stage pipeline).
+"""Inter-stage payloads for the decoupled Qwen3-Omni encoder pipeline.
 
-Flow: audio_encoder(0) → visual_encoder(1) → thinker_lm(2) → talker(3) → code2wav(4)
-
-Transitions:
-  audio_encoder(0) → visual_encoder(1):
-    audio embeddings passed via shared memory connector
-  visual_encoder(1) → thinker_lm(2):
-    combined audio + visual embeddings → LLM input
-  thinker_lm(2) → talker(3):
-    reuses existing qwen3_omni.thinker2talker functions
-  talker(3) → code2wav(4):
-    reuses existing qwen3_omni.talker2code2wav functions
+The audio and visual encoders are independently deployable, but the Thinker
+still requires one embedding *per original multimodal item*.  We therefore
+transport a typed ``embed.encoder`` list and its parallel
+``meta.encoder_modalities`` list.  Consumers must reorder these items by the
+original prompt placeholders; concatenating encoder output in stage order is
+incorrect for prompts that interleave audio, images and video.
 """
 
-import logging
 from typing import Any
 
 import torch
 from vllm.inputs import TextPrompt
 
-from vllm_omni.data_entry_keys import (
-    OmniPayload,
-    OmniPayloadStruct,
-)
+from vllm_omni.data_entry_keys import OmniPayload, OmniPayloadStruct, to_dict, to_struct
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 
-logger = logging.getLogger(__name__)
+
+_VALID_ENCODER_MODALITIES = frozenset({"audio", "image", "video"})
 
 
-def _ensure_list(x):
-    """Convert ConstantList / tensor-like to Python list."""
-    if hasattr(x, "_x"):
-        return list(x._x)
-    elif not isinstance(x, list):
-        return x
-    return list(x)
+def _ensure_list(value: Any) -> Any:
+    if hasattr(value, "_x"):
+        return list(value._x)
+    return list(value) if isinstance(value, tuple) else value
 
 
-# =========================
-# Thinker LM Stage Input (from upstream encoders)
-# =========================
+def _encoder_items(payload: dict[str, Any], *, legacy_modality: str | None = None) -> tuple[list[torch.Tensor], list[str]]:
+    """Read the standard payload, accepting the former private key on input.
 
-
-def encoder2thinker_lm(
-    source_outputs: list[Any],
-    prompt: OmniTokensPrompt | TextPrompt | None = None,
-    requires_multimodal_data: bool = False,
-    streaming_context: Any | None = None,
-) -> list[OmniTokensPrompt]:
-    """Orchestrator-side input processor for thinker_lm (stage 2).
-
-    Receives the output of visual_encoder (stage 1), which contains combined
-    audio + visual embeddings accumulated from stages 0 and 1.
+    The compatibility branch is deliberately read-only: all newly emitted
+    payloads use the typed ``embed.encoder`` / ``meta.encoder_modalities``
+    contract.
     """
-    encoder_outputs = source_outputs
-    lm_inputs: list[OmniTokensPrompt] = []
-
-    for i, enc_output in enumerate(encoder_outputs):
-        output = enc_output.outputs[0]
-        req_id = str(getattr(enc_output, "request_id", f"idx-{i}"))
-        mm_raw = getattr(output, "multimodal_output", None)
-        if not isinstance(mm_raw, dict):
-            logger.debug("encoder2thinker_lm: skip req=%s due to empty multimodal_output", req_id)
-            continue
-
-        encoder_embeddings = mm_raw.get("encoder_embeddings", [])
-        if not encoder_embeddings:
-            logger.debug("encoder2thinker_lm: skip req=%s due to missing encoder_embeddings", req_id)
-            continue
-
-        prompt_token_ids = _ensure_list(enc_output.prompt_token_ids)
-
-        info: dict[str, Any] = {
-            "encoder_embeddings": encoder_embeddings,
-            "prompt_token_ids": prompt_token_ids,
-        }
-
-        lm_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=prompt_token_ids,
-                additional_information=info if info else None,
-                multi_modal_data=None,
-                mm_processor_kwargs=None,
-            )
-        )
-
-    return lm_inputs
+    embed = payload.get("embed", {})
+    meta = payload.get("meta", {})
+    values = embed.get("encoder") if isinstance(embed, dict) else None
+    labels = meta.get("encoder_modalities") if isinstance(meta, dict) else None
+    # Pooling outputs are flattened by the AR/generation runners, while
+    # connector payloads are nested.  Accept both representations at this
+    # boundary and always emit the nested schema below.
+    if values is None:
+        values = payload.get("embed.encoder")
+    if values is None:
+        indexed = [
+            (int(key.rsplit(".", 1)[1]), value)
+            for key, value in payload.items()
+            if key.startswith("embed.encoder.") and key.rsplit(".", 1)[1].isdigit()
+        ]
+        if indexed:
+            values = [value for _, value in sorted(indexed)]
+    if labels is None:
+        labels = payload.get("meta.encoder_modalities")
+    if values is None:
+        values = payload.get("encoder_embeddings", [])
+    if labels is None:
+        labels = [legacy_modality] * len(values) if legacy_modality else []
+    if isinstance(values, torch.Tensor):
+        values = [values]
+    if not isinstance(values, list) or not isinstance(labels, list) or len(values) != len(labels):
+        return [], []
+    items = [value for value in values if isinstance(value, torch.Tensor)]
+    if len(items) != len(labels) or any(label not in _VALID_ENCODER_MODALITIES for label in labels):
+        return [], []
+    return items, list(labels)
 
 
-def encoder2thinker_lm_token_only(
-    source_outputs: list[Any],
-    prompt: OmniTokensPrompt | TextPrompt | None = None,
-    requires_multimodal_data: bool = False,
-    streaming_context: Any | None = None,
-) -> list[OmniTokensPrompt]:
-    """Sync connector variant for encoder→thinker_lm transition.
-
-    Bulk encoder embeddings arrive via the connector's shared memory path.
-    This function only produces the placeholder prompt for KV-cache allocation.
-    """
-    lm_inputs: list[OmniTokensPrompt] = []
-    for i, enc_output in enumerate(source_outputs):
-        prompt_token_ids = _ensure_list(enc_output.prompt_token_ids)
-        lm_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=prompt_token_ids,
-                additional_information=None,
-                multi_modal_data=None,
-                mm_processor_kwargs=None,
-            )
-        )
-    return lm_inputs
-
-
-# =========================
-# Connector Path (full_payload / async_chunk)
-# =========================
+def _pack_encoder_payload(pooling_output: dict[str, Any], *, legacy_modality: str | None) -> dict[str, Any]:
+    embeddings, modalities = _encoder_items(pooling_output, legacy_modality=legacy_modality)
+    payload: OmniPayload = {
+        "embed": {"encoder": [embedding.detach().cpu() for embedding in embeddings]},
+        "meta": {
+            "encoder_modalities": modalities,
+            "finished": torch.tensor(True, dtype=torch.bool),
+        },
+    }
+    # Validate the outbound schema now, before it becomes an opaque SHM blob.
+    return to_dict(to_struct(payload))
 
 
 def audio2visual_full_payload(
@@ -126,30 +86,10 @@ def audio2visual_full_payload(
     pooling_output: dict[str, Any],
     request: OmniEngineCoreRequest,
 ) -> dict[str, Any] | None:
-    """Connector next-stage for audio_encoder (stage 0) → visual_encoder (stage 1).
-
-    Packages audio encoder embeddings for shared memory transfer.
-    """
-    rid = getattr(request, "request_id", None)
+    """Send audio encoder items to Stage 1 using the common payload schema."""
     if not isinstance(pooling_output, dict):
-        logger.warning(
-            "audio2visual_full_payload: pooling_output not a dict (type=%s) for req=%s",
-            type(pooling_output).__name__, rid,
-        )
         return None
-
-    encoder_embeddings = pooling_output.get("encoder_embeddings")
-    if encoder_embeddings is None:
-        logger.debug("audio2visual_full_payload: no encoder_embeddings for req=%s", rid)
-        return None
-
-    if isinstance(encoder_embeddings, torch.Tensor):
-        encoder_embeddings = [encoder_embeddings]
-
-    return {
-        "encoder_embeddings": [e.detach().cpu() if isinstance(e, torch.Tensor) else e for e in encoder_embeddings],
-        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
-    }
+    return _pack_encoder_payload(pooling_output, legacy_modality="audio")
 
 
 def visual2thinker_full_payload(
@@ -157,30 +97,80 @@ def visual2thinker_full_payload(
     pooling_output: dict[str, Any],
     request: OmniEngineCoreRequest,
 ) -> dict[str, Any] | None:
-    """Connector next-stage for visual_encoder (stage 1) → thinker_lm (stage 2).
-
-    Packages combined audio + visual embeddings for shared memory transfer.
-    """
-    rid = getattr(request, "request_id", None)
+    """Send the carried audio plus new visual items to the Thinker stage."""
     if not isinstance(pooling_output, dict):
-        logger.warning(
-            "visual2thinker_full_payload: pooling_output not a dict (type=%s) for req=%s",
-            type(pooling_output).__name__, rid,
+        return None
+    return _pack_encoder_payload(pooling_output, legacy_modality=None)
+
+
+def _token_only(source_outputs: list[Any]) -> list[OmniTokensPrompt]:
+    # Full tensors are delivered through the connector into
+    # model_intermediate_buffer.  The scheduler only needs prompt ids here.
+    return [
+        OmniTokensPrompt(
+            prompt_token_ids=_ensure_list(output.prompt_token_ids),
+            additional_information=None,
+            multi_modal_data=None,
+            mm_processor_kwargs=None,
         )
-        return None
+        for output in source_outputs
+    ]
 
-    encoder_embeddings = pooling_output.get("encoder_embeddings")
-    if encoder_embeddings is None:
-        logger.debug("visual2thinker_full_payload: no encoder_embeddings for req=%s", rid)
-        return None
 
-    if isinstance(encoder_embeddings, torch.Tensor):
-        encoder_embeddings = [encoder_embeddings]
+def audio2visual_token_only(
+    source_outputs: list[Any],
+    prompt: OmniTokensPrompt | TextPrompt | None = None,
+    requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
+) -> list[OmniTokensPrompt]:
+    return _token_only(source_outputs)
 
-    return {
-        "encoder_embeddings": [e.detach().cpu() if isinstance(e, torch.Tensor) else e for e in encoder_embeddings],
-        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
-    }
+
+def visual2thinker_token_only(
+    source_outputs: list[Any],
+    prompt: OmniTokensPrompt | TextPrompt | None = None,
+    requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
+) -> list[OmniTokensPrompt]:
+    return _token_only(source_outputs)
+
+
+def _prompt_with_encoder_payload(source_outputs: list[Any]) -> list[OmniTokensPrompt]:
+    """Fallback direct path; mirrors the connector's standard payload."""
+    result: list[OmniTokensPrompt] = []
+    for output in source_outputs:
+        completion = output.outputs[0]
+        mm_output = getattr(completion, "multimodal_output", None)
+        if not isinstance(mm_output, dict):
+            continue
+        payload = _pack_encoder_payload(mm_output, legacy_modality=None)
+        result.append(
+            OmniTokensPrompt(
+                prompt_token_ids=_ensure_list(output.prompt_token_ids),
+                additional_information=payload,
+                multi_modal_data=None,
+                mm_processor_kwargs=None,
+            )
+        )
+    return result
+
+
+def audio2visual(
+    source_outputs: list[Any],
+    prompt: OmniTokensPrompt | TextPrompt | None = None,
+    requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
+) -> list[OmniTokensPrompt]:
+    return _prompt_with_encoder_payload(source_outputs)
+
+
+def visual2thinker(
+    source_outputs: list[Any],
+    prompt: OmniTokensPrompt | TextPrompt | None = None,
+    requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
+) -> list[OmniTokensPrompt]:
+    return _prompt_with_encoder_payload(source_outputs)
 
 
 def audio2visual_async_chunk(
@@ -189,12 +179,11 @@ def audio2visual_async_chunk(
     request: OmniEngineCoreRequest,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
-    """Async chunk variant for audio_encoder → visual_encoder."""
     payload = audio2visual_full_payload(transfer_manager, pooling_output, request)
     if payload is None:
         return None
     payload["meta"]["finished"] = torch.tensor(is_finished, dtype=torch.bool)
-    return payload
+    return to_struct(payload)
 
 
 def visual2thinker_async_chunk(
@@ -203,9 +192,8 @@ def visual2thinker_async_chunk(
     request: OmniEngineCoreRequest,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
-    """Async chunk variant for visual_encoder → thinker_lm."""
     payload = visual2thinker_full_payload(transfer_manager, pooling_output, request)
     if payload is None:
         return None
     payload["meta"]["finished"] = torch.tensor(is_finished, dtype=torch.bool)
-    return payload
+    return to_struct(payload)

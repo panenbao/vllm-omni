@@ -386,6 +386,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             is_segment_finished = False
             new_logprobs = None
             new_token_ids = generated_token_ids
+            # [DEBUG] Log generated tokens at each step
+            if new_token_ids:
+                logger.info("[TOKEN_OUT] req=%s step_num_tokens=%d new_token_ids=%s",
+                            req_id, num_tokens_scheduled, new_token_ids)
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             kv_transfer_params = None
             status_before_stop = request.status

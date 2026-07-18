@@ -154,6 +154,8 @@ class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
         x: torch.Tensor,
         grid_thw,
     ) -> torch.Tensor:
+        logger.info("[VISUAL_CMP][ORIG] ViT forward input shape=%s grid_thw=%s",
+                    x.shape, grid_thw.tolist() if hasattr(grid_thw, 'tolist') else grid_thw)
         hidden_states = x.to(device=self.device, dtype=self.dtype)
         hidden_states = self.patch_embed(hidden_states)
 
@@ -200,6 +202,38 @@ class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
         rotary_pos_emb_sin = rotary_pos_emb_sin.to(hidden_states.device)
         max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
 
+        # Ensure max_seqlen is safe to access on CPU before downstream code
+        # calls `.item()` or performs host-side operations. If it's a CUDA
+        # tensor and accessing it triggers a CUDA illegal memory access,
+        # fall back to a CPU copy or None to avoid crashing the worker.
+        # if max_seqlen is not None and isinstance(max_seqlen, torch.Tensor):
+        #     try:
+        #         device = max_seqlen.device
+        #     except Exception:
+        #         device = None
+
+        #     if device is not None and device.type == "cuda":
+        #         try:
+        #             # Try to move to CPU safely. This may still raise a
+        #             # torch.AcceleratorError if the CUDA kernel previously
+        #             # failed; catch and degrade gracefully.
+        #             max_seqlen = max_seqlen.detach().cpu()
+        #         except torch.AcceleratorError as e:
+        #             logger.debug(
+        #                 "CUDA accelerator error when accessing max_seqlen: %s. "
+        #                 "Falling back to None to avoid illegal memory access.",
+        #                 e,
+        #             )
+        #             max_seqlen = None
+        #         except RuntimeError as e:
+        #             logger.debug(
+        #                 "Runtime error when moving max_seqlen from %s to CPU: %s. "
+        #                 "Falling back to None.",
+        #                 device,
+        #                 e,
+        #             )
+        #             max_seqlen = None
+
         grid_thw_np = grid_thw_tensor.cpu().numpy().astype(np.int32)
         cu_seqlens_np = np.repeat(grid_thw_np[:, 1] * grid_thw_np[:, 2], grid_thw_np[:, 0]).cumsum(
             axis=0, dtype=np.int32
@@ -236,6 +270,9 @@ class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
                 processed_hidden_states_list.append(x_ds)
             hidden_states = torch.cat(processed_hidden_states_list, dim=1)
 
+        logger.info("[VISUAL_CMP][ORIG] ViT output shape=%s mean=%s std=%s",
+                    hidden_states.shape, hidden_states.float().mean().item(),
+                    hidden_states.float().std().item())
         return hidden_states
 
 
@@ -467,7 +504,50 @@ class Qwen3OmniMoeAudioEncoder(_Qwen3OmniMoeAudioEncoder):
                 cu_chunk_lens.append(remainder)
         cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
 
+        # logger.debug("cu_seqlens.device = %s", cu_seqlens.device)
         max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
+        # logger.debug("max_seqlen.device = %s", max_seqlen.device if isinstance(max_seqlen, torch.Tensor) else None)
+        # # Always emit logging about max_seqlen so we can diagnose device
+        # # placement and access issues (including CUDA illegal memory
+        # # access). Keep inspections minimal to avoid triggering device
+        # # side errors; only query attributes that are unlikely to run
+        # # kernels. If the tensor is on CUDA, attempt a safe CPU copy and
+        # # log success/failure.
+        # try:
+        #     if isinstance(max_seqlen, torch.Tensor):
+        #         try:
+        #             dev = getattr(max_seqlen, "device", None)
+        #             dt = getattr(max_seqlen, "dtype", None)
+        #             ne = max_seqlen.numel()
+        #             logger.debug(
+        #                 "max_seqlen: tensor device=%s dtype=%s numel=%s",
+        #                 dev,
+        #                 dt,
+        #                 ne,
+        #             )
+        #         except Exception as e:
+        #             logger.debug("max_seqlen: tensor (inspection failed: %s)", e)
+        #     else:
+        #         logger.debug("max_seqlen: %r", max_seqlen)
+        # except Exception as e:
+        #     logger.warning("Unexpected error while logging max_seqlen: %s", e)
+
+        # # Perform a non-invasive device check. Do NOT modify or move the
+        # # tensor here — only log device/dtype info. Moving to CPU would
+        # # require moving it back later; to avoid data mutation, we only
+        # # warn if the tensor lives on CUDA so callers avoid `.item()`.
+        # if isinstance(max_seqlen, torch.Tensor):
+        #     dev = getattr(max_seqlen, "device", None)
+        #     if dev is not None and getattr(dev, "type", None) == "cuda":
+        #         logger.debug(
+        #             "max_seqlen is on CUDA device=%s dtype=%s numel=%s; "
+        #             "avoid calling .item() directly to prevent illegal memory access.",
+        #             dev,
+        #             getattr(max_seqlen, "dtype", None),
+        #             max_seqlen.numel(),
+        #         )
+        #     else:
+        #         logger.debug("max_seqlen device=%s dtype=%s numel=%s", dev, getattr(max_seqlen, "dtype", None), max_seqlen.numel())
 
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(
@@ -1054,13 +1134,40 @@ class Qwen3OmniMoeConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMix
 
         audio_output_lengths = _get_feat_extract_output_lengths(audio_feature_lengths)
 
+        # ==== DEBUG: audio_tower 调用前 ====
+        _feat_cpu = input_features.detach().cpu().float()
+        logger.info("[AUDIO_CMP] input_features shape=%s dtype=%s mean=%s std=%s min=%s max=%s",
+                    input_features.shape, input_features.dtype,
+                    _feat_cpu.mean().item(), _feat_cpu.std().item(),
+                    _feat_cpu.min().item(), _feat_cpu.max().item())
+        logger.info("[AUDIO_CMP] feature_lens=%s aftercnn_lens=%s",
+                    audio_feature_lengths.tolist(), audio_output_lengths.tolist())
+
         audio_outputs = self.audio_tower(
             input_features.to(self.audio_tower.dtype),
             feature_lens=audio_feature_lengths,
             aftercnn_lens=audio_output_lengths,
         )
         audio_features = audio_outputs if isinstance(audio_outputs, torch.Tensor) else audio_outputs.last_hidden_state
-        return audio_features.split(audio_output_lengths.tolist())
+
+        # ==== DEBUG: audio_tower 调用后（split 前） ====
+        _out_cpu = audio_features.detach().cpu().float()
+        logger.info("[AUDIO_CMP] audio_tower output shape=%s mean=%s std=%s min=%s max=%s",
+                    audio_features.shape,
+                    _out_cpu.mean().item(), _out_cpu.std().item(),
+                    _out_cpu.min().item(), _out_cpu.max().item())
+
+        chunks = audio_features.split(audio_output_lengths.tolist())
+
+        # ==== DEBUG: split 后 ====
+        for i, chunk in enumerate(chunks):
+            _ch_cpu = chunk.detach().cpu().float()
+            logger.info("[AUDIO_CMP] chunk[%d] shape=%s mean=%s std=%s min=%s max=%s",
+                        i, chunk.shape,
+                        _ch_cpu.mean().item(), _ch_cpu.std().item(),
+                        _ch_cpu.min().item(), _ch_cpu.max().item())
+
+        return chunks
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1299,14 +1406,32 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         for modality in mm_input_by_modality:
             multimodal_input = mm_input_by_modality[modality]
             if modality == "image":
+                pixel_values = multimodal_input.get("pixel_values")
+                logger.info("[VISUAL_CMP][ORIG] image input: pixel_values shape=%s grid_thw=%s mean=%s std=%s",
+                            multimodal_input["pixel_values"].shape if hasattr(multimodal_input, "get") else "?",
+                            multimodal_input.get("image_grid_thw", "?") if hasattr(multimodal_input, "get") else "?",
+                            pixel_values.float().mean().item(), pixel_values.float().std().item())
                 image_embeddings = self._process_image_input(multimodal_input)
+                for i, emb in enumerate(image_embeddings):
+                    logger.info("[VISUAL_CMP][ORIG] image_embed[%d] shape=%s mean=%s std=%s",
+                                i, emb.shape, emb.float().mean().item(), emb.float().std().item())
                 multimodal_embeddings += tuple(image_embeddings)
             if modality == "video":
                 video_embeddings = self._process_video_input(multimodal_input)
+                for i, emb in enumerate(video_embeddings):
+                    logger.info("[VISUAL_CMP] video_embed[%d] shape=%s mean=%s std=%s",
+                                i, emb.shape, emb.float().mean().item(), emb.float().std().item())
                 multimodal_embeddings += tuple(video_embeddings)
             if modality == "audio":
                 audio_embeddings = self._process_audio_input(multimodal_input)
+                for i, emb in enumerate(audio_embeddings):
+                    logger.info("[AUDIO_CMP] audio_embed[%d] shape=%s mean=%s std=%s",
+                                i, emb.shape, emb.float().mean().item(), emb.float().std().item())
                 multimodal_embeddings += tuple(audio_embeddings)
+        # # [DEBUG FUSED] All modality embeddings at gather point
+        # for i, emb in enumerate(multimodal_embeddings):
+        #     logger.info("[DBG_FUSED] embed_multimodal[%d] shape=%s mean=%s std=%s",
+        #                 i, emb.shape, emb.float().mean().item(), emb.float().std().item())
         return multimodal_embeddings
 
     def embed_input_ids(
@@ -1324,6 +1449,15 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             return inputs_embeds
+
+        # # [DEBUG FUSED] Merge-point stats
+        # logger.info("[DBG_FUSED] text_embed shape=%s mean=%s std=%s",
+        #             inputs_embeds.shape, inputs_embeds.float().mean().item(),
+        #             inputs_embeds.float().std().item())
+        # for i, emb in enumerate(multimodal_embeddings):
+        #     _tag = "visual" if emb.shape[-1] != inputs_embeds.shape[-1] else "audio"
+        #     logger.info("[DBG_FUSED] mm_before_split[%d](%s) shape=%s mean=%s std=%s",
+        #                 i, _tag, emb.shape, emb.float().mean().item(), emb.float().std().item())
 
         # Detect interleaved audio-in-video early, since it affects
         # both the deepstack path and the final embedding merge.
@@ -1365,6 +1499,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                     multi_dim = visual_dim * multiscale_len
                     embeddings_main, embeddings_multiscale = torch.split(embeddings, [visual_dim, multi_dim], dim=-1)
                     multimodal_embeddings[index] = embeddings_main
+                    # # [DEBUG FUSED] After deepstack split
+                    # logger.info("[DBG_FUSED] mm_after_split[%d] shape=%s mean=%s std=%s",
+                    #             index, embeddings_main.shape,
+                    #             embeddings_main.float().mean().item(),
+                    #             embeddings_main.float().std().item())
                     multimodal_embeddings_multiscale.append(embeddings_multiscale)
                     if not is_interleaved:
                         current_positions = mm_positions[mm_position_idx : mm_position_idx + num_tokens]
@@ -1395,7 +1534,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             self._set_deepstack_input_embeds(deepstack_input_embeds)
 
         if is_interleaved:
-            return merge_interleaved_embeddings(
+            _result = merge_interleaved_embeddings(
                 inputs_embeds,
                 multimodal_embeddings,
                 is_video,
@@ -1404,16 +1543,35 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 num_video,
                 num_audio,
             )
+        else:
+            # Default: standard merge (no interleaving), same as parent class.
+            # multimodal_embeddings may have been updated above (deepstack
+            # main-scale). Use super() to stay consistent with the parent
+            # implementation and avoid issues seen in Qwen2.5-Omni (#34506).
+            _result = super().embed_input_ids(
+                input_ids,
+                multimodal_embeddings=multimodal_embeddings,
+                is_multimodal=is_multimodal,
+            )
 
-        # Default: standard merge (no interleaving), same as parent class.
-        # multimodal_embeddings may have been updated above (deepstack
-        # main-scale). Use super() to stay consistent with the parent
-        # implementation and avoid issues seen in Qwen2.5-Omni (#34506).
-        return super().embed_input_ids(
-            input_ids,
-            multimodal_embeddings=multimodal_embeddings,
-            is_multimodal=is_multimodal,
-        )
+        # # [DEBUG] Log per-token embedding stats for the full merged sequence
+        # _vt = getattr(self.config, "video_token_id", None)
+        # _at = getattr(self.config, "audio_token_id", None)
+        # _it = getattr(self.config, "image_token_id", None)
+        # _tok_id_map = {}
+        # for _tid, _nm in [(_vt, "V"), (_at, "A"), (_it, "I")]:
+        #     if _tid is not None:
+        #         _m = input_ids == _tid
+        #         if _m.any():
+        #             _tok_id_map[_tid] = _nm
+        # for _pos in range(_result.shape[0]):
+        #     _tok = input_ids[_pos].item()
+        #     _tag = _tok_id_map.get(_tok, "T")
+        #     _v = _result[_pos].float()
+        #     logger.info("[EMB_DBG] FUSED pos=%5d tag=%s tok=%6d mean=%9.6f std=%9.6f min=%9.6f max=%9.6f",
+        #                 _pos, _tag, _tok, _v.mean().item(), _v.std().item(),
+        #                 _v.min().item(), _v.max().item())
+        return _result
 
     def forward(
         self,
@@ -1670,6 +1828,22 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         mm_features: list[MultiModalFeatureSpec],
         **kwargs,
     ) -> tuple[torch.Tensor, int]:
+        # ==== DEBUG: dump input_tokens and mm_features ====
+        import json, os
+        _dbg = {"input_tokens_len": len(input_tokens), "input_tokens_preview": input_tokens[:50],
+                "mm_features_count": len(mm_features) if mm_features else 0}
+        if mm_features:
+            _dbg["mm_features_detail"] = []
+            for i, mf in enumerate(mm_features):
+                _dbg["mm_features_detail"].append({
+                    "idx": i, "modality": mf.modality, "offset": mf.mm_position.offset,
+                    "length": mf.mm_position.length, "keys": list(mf.data.keys()) if hasattr(mf.data, 'keys') else str(type(mf.data)),
+                })
+        os.makedirs("/home/MotivationExperiment/logs/debug_mrope_old", exist_ok=True)
+        with open(f"/home/MotivationExperiment/logs/debug_mrope_old/mrope_{os.getpid()}.json", "w") as f:
+            json.dump(_dbg, f, indent=2, default=str)
+        logger.info("[MROPE_DEBUG] dumped to /home/MotivationExperiment/logs/debug_mrope_old/mrope_%s.json", os.getpid())
+
         """Compute M-RoPE input positions using mm_features directly."""
         seq_len = len(input_tokens)
 

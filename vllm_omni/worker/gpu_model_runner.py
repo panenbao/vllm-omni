@@ -58,6 +58,72 @@ class OmniGPUModelRunner(GPUModelRunner):
         # when we initialize the metadata builders if enabled
         self.omni_prefix_cache = None
 
+    def _format_scheduler_output_summary(self, scheduler_output: "SchedulerOutput") -> str:
+        def summarize_dict_of_lens(d: dict, max_items: int = 8) -> str:
+            if not d:
+                return "{}"
+            items = list(d.items())
+            parts = []
+            for key, value in items[:max_items]:
+                try:
+                    parts.append(f"{key}:{len(value)}")
+                except Exception:
+                    parts.append(f"{key}:?")
+            if len(items) > max_items:
+                parts.append(f"...({len(items)} keys)")
+            return "{" + ", ".join(parts) + "}"
+
+        def summarize_dict_keys(d: dict, max_items: int = 10) -> str:
+            if not d:
+                return "{}"
+            keys = list(d.keys())
+            displayed = keys[:max_items]
+            suffix = "..." if len(keys) > max_items else ""
+            return "{" + ", ".join(map(str, displayed)) + suffix + "}"
+
+        def summarize_req_ids(reqs: list[object], max_items: int = 10) -> str:
+            if not reqs:
+                return "[]"
+            ids = [getattr(req, "req_id", str(req)) for req in reqs[:max_items]]
+            suffix = "..." if len(reqs) > max_items else ""
+            return f"[{', '.join(ids)}{suffix}]"
+
+        def summarize_lengths(values: list[object], max_items: int = 10) -> str:
+            if not values:
+                return "[]"
+            lens = []
+            for value in values[:max_items]:
+                try:
+                    lens.append(str(len(value)))
+                except Exception:
+                    lens.append("?")
+            suffix = "..." if len(values) > max_items else ""
+            return f"[{', '.join(lens)}{suffix}]"
+
+        cached = scheduler_output.scheduled_cached_reqs
+        num_scheduled = scheduler_output.num_scheduled_tokens
+        return (
+            "SchedulerOutput(\n"
+            f"  total_num_scheduled_tokens={scheduler_output.total_num_scheduled_tokens},\n"
+            f"  finished_req_ids={len(scheduler_output.finished_req_ids)},\n"
+            f"  free_encoder_mm_hashes={len(scheduler_output.free_encoder_mm_hashes)},\n"
+            f"  new_block_ids_to_zero={len(scheduler_output.new_block_ids_to_zero) if scheduler_output.new_block_ids_to_zero is not None else 0},\n"
+            f"  scheduled_new_reqs={len(scheduler_output.scheduled_new_reqs)},\n"
+            f"  scheduled_new_reqs_ids={summarize_req_ids(scheduler_output.scheduled_new_reqs)},\n"
+            f"  scheduled_cached_reqs.num_reqs={cached.num_reqs},\n"
+            f"  scheduled_cached_reqs.resumed_req_ids={len(cached.resumed_req_ids)},\n"
+            f"  scheduled_cached_reqs.new_token_ids_lens={summarize_lengths(cached.new_token_ids)},\n"
+            f"  scheduled_cached_reqs.all_token_ids_lens={summarize_dict_of_lens(cached.all_token_ids)},\n"
+            f"  scheduled_cached_reqs.all_token_ids_keys={summarize_dict_keys(cached.all_token_ids)},\n"
+            f"  scheduled_cached_reqs.new_block_ids_count={len(cached.new_block_ids)},\n"
+            f"  scheduled_cached_reqs.num_computed_tokens={summarize_lengths(cached.num_computed_tokens)},\n"
+            f"  scheduled_cached_reqs.num_output_tokens={summarize_lengths(cached.num_output_tokens)},\n"
+            f"  scheduled_spec_decode_tokens={summarize_dict_of_lens(scheduler_output.scheduled_spec_decode_tokens)},\n"
+            f"  num_scheduled_tokens.count={len(num_scheduled)},\n"
+            f"  num_scheduled_tokens.values={summarize_lengths(list(num_scheduled.values()))}\n"
+            ")"
+        )
+
     def _omni_routed_experts_d2h(self, scheduler_output) -> None:
         """Issue routed-experts D2H copy matching upstream GPUModelRunner pattern.
 
@@ -404,6 +470,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        # logger.debug(
+        #     "Updating states with scheduler_output: %s",
+        #     self._format_scheduler_output_summary(scheduler_output),
+        # )
         # Used for prefix cache
         if self.omni_prefix_cache is not None:
             self.omni_prefix_cache.reset_prefix_cached_new_req_ids()
@@ -460,6 +530,9 @@ class OmniGPUModelRunner(GPUModelRunner):
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
         resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        # logger.debug(f"Scheduled req IDs: {scheduled_req_ids}"
+        #              f"Cached req IDs: {cached_req_ids}"
+        #              f"Resumed req IDs: {resumed_req_ids}")
         # NOTE(zhuohan): cached_req_ids and resumed_req_ids are usually disjoint,
         # so `(scheduled_req_ids - resumed_req_ids) == scheduled_req_ids` holds
         # apart from the forced-preemption case in reset_prefix_cache. And in
@@ -559,6 +632,10 @@ class OmniGPUModelRunner(GPUModelRunner):
                             "additional_information_cpu",
                             info_dict,
                         )
+                        logger.info("[ADDINFO] req=%s additional_information keys=%s has_encoder_emb=%s type=%s",
+                                    req_id, list(info_dict.keys()),
+                                    "encoder_embeddings" in info_dict,
+                                    type(info_dict.get("encoder_embeddings")).__name__ if info_dict.get("encoder_embeddings") else "N/A")
             except Exception as e:
                 logger.error(f"Error decoding additional information: {e}")
 
@@ -686,6 +763,18 @@ class OmniGPUModelRunner(GPUModelRunner):
                 if self.use_async_scheduling and num_output_tokens > 0:
                     # We must recover the output token ids for resumed requests in the
                     # async scheduling case, so that correct input_ids are obtained.
+                    if req_id not in req_data.all_token_ids:
+                        logger.error(
+                            "Resumed req_id %s missing from scheduled_cached_reqs.all_token_ids. "
+                            "scheduled_cached_reqs.req_ids=%s resumed_req_ids=%s all_token_ids_keys=%s",
+                            req_id,
+                            req_data.req_ids,
+                            sorted(req_data.resumed_req_ids),
+                            list(req_data.all_token_ids.keys()),
+                        )
+                        raise KeyError(
+                            f"Missing resumed req_id {req_id} in scheduled_cached_reqs.all_token_ids"
+                        )
                     resumed_token_ids = req_data.all_token_ids[req_id]
                     req_state.output_token_ids = resumed_token_ids[-num_output_tokens:]
 
@@ -1274,6 +1363,17 @@ class OmniGPUModelRunner(GPUModelRunner):
                 cache.pop(req_id, None)
         for req_id, payload in staged.items():
             self._update_intermediate_buffer(req_id, payload)
+            # # [DEBUG] Log connector-delivered payload at sync time
+            # _embed = payload.get("embed", {}) if isinstance(payload, dict) else {}
+            # _meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+            # _items = _embed.get("encoder", []) if isinstance(_embed, dict) else []
+            # _labels = _meta.get("encoder_modalities", []) if isinstance(_meta, dict) else []
+            # if _items and _labels and len(_items) == len(_labels):
+            #     for _i, (_emb, _mod) in enumerate(zip(_items, _labels)):
+            #         if isinstance(_emb, torch.Tensor):
+            #             logger.info("[DBG_SYNC] req=%s connector %s[%d] shape=%s mean=%s std=%s",
+            #                         req_id, _mod, _i, _emb.shape,
+            #                         _emb.float().mean().item(), _emb.float().std().item())
 
     def _build_model_kwargs_extra(self) -> dict:
         """Build extra keyword arguments passed to the model for this step."""
@@ -1378,13 +1478,33 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self.inputs_embeds.gpu[start_offset : start_offset + overlay_len].copy_(src)
 
     def _update_additional_information(self, scheduler_output: "SchedulerOutput") -> None:
+        from vllm_omni.engine.serialization import deserialize_additional_information
+
         for new_req in scheduler_output.scheduled_new_reqs:
             payload_info = getattr(new_req, "additional_information", None)
+            logger.info("[ADDINFO_RAW] req=%s payload=%s type=%s",
+                        new_req.req_id, payload_info is not None, type(payload_info).__name__)
             if isinstance(payload_info, dict):
                 logger.warning_once(
                     "additional_information on request data is deprecated, use model_intermediate_buffer"
                 )
                 self._update_intermediate_buffer(new_req.req_id, payload_info)
+            elif payload_info is not None:
+                logger.info("[ADDINFO_RAW] req=%s payload_type=%s entries=%s",
+                            new_req.req_id, type(payload_info).__name__,
+                            len(payload_info.entries) if hasattr(payload_info, 'entries') else '?')
+                try:
+                    info_dict = deserialize_additional_information(payload_info)
+                except Exception as e:
+                    logger.error("[ADDINFO_RAW] deserialize FAILED for req=%s: %s", new_req.req_id, e)
+                    continue
+                if info_dict:
+                    logger.info("[ADDINFO_RAW] req=%s deserialized keys=%s", new_req.req_id, list(info_dict.keys()))
+                    self._update_intermediate_buffer(new_req.req_id, info_dict)
+                else:
+                    logger.info("[ADDINFO_RAW] req=%s info_dict empty", new_req.req_id)
+            else:
+                logger.info("[ADDINFO_RAW] req=%s additional_information is None", new_req.req_id)
 
         if hasattr(scheduler_output.scheduled_cached_reqs, "additional_information"):
             logger.warning_once(
@@ -1434,6 +1554,154 @@ class OmniGPUModelRunner(GPUModelRunner):
             device=device,
         )
 
+    def _gather_mm_embeddings(
+        self,
+        scheduler_output: "SchedulerOutput",
+        shift_computed_tokens: int = 0,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        """Override parent to skip mm_features not scheduled for this stage.
+
+        In a decoupled pipeline each encoder stage (audio_encoder/visual_encoder)
+        only processes its own modality.  ``scheduler_output.scheduled_encoder_inputs``
+        indicates which mm_feature indices were actually encoded by this stage.
+        Features belonging to a different stage (e.g. visual features during the
+        audio encoder forward) are skipped instead of crashing the missing-hash
+        assertion in the parent implementation.
+
+        When ``scheduled_encoder_inputs`` is empty (text-only or fused model) the
+        method falls back to the original behaviour — no filtering is applied.  An
+        encoder stage with real multimodal work always has a non-empty schedule.
+        """
+        scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
+
+        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+
+        mm_embeds = list[torch.Tensor]()
+        is_mm_embed = torch.zeros(
+            total_num_scheduled_tokens, dtype=torch.bool, device="cpu"
+        )
+
+        req_start_idx = 0
+        should_sync_mrope_positions = False
+        should_sync_xdrope_positions = False
+
+        for req_id in self.input_batch.req_ids:
+            mm_embeds_req: list[torch.Tensor] = []
+
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            req_state = self.requests[req_id]
+            num_computed_tokens = req_state.num_computed_tokens + shift_computed_tokens
+
+            # Build a set of mm_feature indices that this stage actually
+            # encoded.  When the schedule is empty we process *all* features
+            # (backward-compatible path for fused models / text-only batches).
+            scheduled_ids: set[int] | None = None
+            if scheduled_encoder_inputs is not None:
+                ids = scheduled_encoder_inputs.get(req_id)
+                if ids is not None:
+                    scheduled_ids = set(ids)
+
+            for idx, mm_feature in enumerate(req_state.mm_features):
+                pos_info = mm_feature.mm_position
+                start_pos = pos_info.offset
+                num_encoder_tokens = pos_info.length
+
+                # The encoder output is needed if the two ranges overlap:
+                # [num_computed_tokens,
+                #  num_computed_tokens + num_scheduled_tokens) and
+                # [start_pos, start_pos + num_encoder_tokens)
+                if start_pos >= num_computed_tokens + num_scheduled_tokens:
+                    # The encoder output is not needed in this step.
+                    break
+                if start_pos + num_encoder_tokens <= num_computed_tokens:
+                    # The encoder output is already processed and stored
+                    # in the decoder's KV cache.
+                    continue
+
+                # [Decoupled] Skip mm_features that were not scheduled for
+                # encoding at this stage (e.g. visual features in the audio
+                # encoder process).
+                if scheduled_ids is not None and idx not in scheduled_ids:
+                    continue
+
+                start_idx = max(num_computed_tokens - start_pos, 0)
+                end_idx = min(
+                    num_computed_tokens - start_pos + num_scheduled_tokens,
+                    num_encoder_tokens,
+                )
+                assert start_idx < end_idx
+                curr_embeds_start, curr_embeds_end = (
+                    pos_info.get_embeds_indices_in_range(start_idx, end_idx)
+                )
+                # If there are no embeddings in the current range, we skip
+                # gathering the embeddings.
+                if curr_embeds_start == curr_embeds_end:
+                    continue
+
+                mm_hash = mm_feature.identifier
+                encoder_output = self.encoder_cache.get(mm_hash, None)
+                assert encoder_output is not None, (
+                    f"Encoder cache miss for {mm_hash}."
+                )
+                logger.debug("Gathering mm embeddings for req_id %s, mm_hash %s, "
+                    "start_idx %d, end_idx %d, curr_embeds_start %d, "
+                    "curr_embeds_end %d",
+                    req_id, mm_hash, start_idx, end_idx,
+                    curr_embeds_start, curr_embeds_end)
+                if (is_embed := pos_info.is_embed) is not None:
+                    is_embed = is_embed[start_idx:end_idx]
+                    mm_embeds_item = encoder_output[curr_embeds_start:curr_embeds_end]
+                else:
+                    mm_embeds_item = encoder_output[start_idx:end_idx]
+
+                # # [DEBUG] Log per-modality token-position range in the input sequence
+                # _seq_start = req_start_idx + max(0, start_pos - num_computed_tokens)
+                # _seq_end = req_start_idx + min(num_scheduled_tokens, start_pos + num_encoder_tokens - num_computed_tokens)
+                # logger.info("[POS_MAP] req=%s modality=%s seq_tokens=[%d:%d] mm_tokens=[%d:%d] mm_hash=%s",
+                #             req_id, mm_feature.modality,
+                #             _seq_start, _seq_end,
+                #             curr_embeds_start, curr_embeds_end,
+                #             mm_hash[:12])
+
+                req_start_pos = req_start_idx + start_pos - num_computed_tokens
+                # OR mask for overlapping mm_features (use_audio_in_video)
+                if is_embed is None:
+                    is_mm_embed[req_start_pos + start_idx: req_start_pos + end_idx] = (
+                        True
+                    )
+                else:
+                    is_mm_embed[
+                        req_start_pos + start_idx: req_start_pos + end_idx
+                    ] |= is_embed
+                mm_embeds_req.append(mm_embeds_item)
+
+            if self.is_multimodal_pruning_enabled and self.uses_mrope:
+                assert req_state.mrope_positions is not None
+                should_sync_mrope_positions = True
+                mm_embeds_req, new_mrope_positions, new_delta = (
+                    self.model.recompute_mrope_positions(
+                        input_ids=req_state.prompt_token_ids,
+                        multimodal_embeddings=mm_embeds_req,
+                        mrope_positions=req_state.mrope_positions,
+                        num_computed_tokens=req_state.num_computed_tokens,
+                    )
+                )
+                req_state.mrope_positions.copy_(new_mrope_positions)
+                req_state.mrope_position_delta = new_delta
+
+            mm_embeds.extend(mm_embeds_req)
+            req_start_idx += num_scheduled_tokens
+
+        if should_sync_mrope_positions:
+            self._calc_mrope_positions(scheduler_output)
+            self.mrope_positions.copy_to_gpu(total_num_scheduled_tokens)
+
+        if should_sync_xdrope_positions:
+            self._calc_xdrope_positions(scheduler_output)
+            self.xdrope_positions.copy_to_gpu(total_num_scheduled_tokens)
+
+        return mm_embeds, is_mm_embed
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1449,13 +1717,126 @@ class OmniGPUModelRunner(GPUModelRunner):
         # modal outputs after that to ensure the correct order
         ec_connector_output = None
 
+        # _cached_encoder_embeddings lives on the inner stage (self.model.model / stage),
+        # not on self.model (the decoupled wrapper).
+        _inner_stage = getattr(self.model, "model", None) or getattr(self.model, "stage", None)
+        _has_cache = hasattr(_inner_stage, "_cached_encoder_embeddings") if _inner_stage is not None else False
+        # [Decoupled] Sync connector-delivered encoder payloads from
+        # _local_stage_payload_cache into model_intermediate_buffer BEFORE
+        # the pre-population block reads it.  Without this the payload sits
+        # in the connector cache and is only moved later by
+        # _build_model_kwargs_extra → _sync_local_stage_payloads, which is
+        # called AFTER pre-population — causing an "[EMBED_CACHE_GATE]
+        # encoder payload missing" for the LLM stage.
+        self._sync_local_stage_payloads()
+        # Ensure additional_information is processed before multimodal encoding,
+        # so model_intermediate_buffer is populated for encoder_cache injection below.
+        if _has_cache:
+            self._update_additional_information(scheduler_output)
+
         if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
-            # Run the multimodal encoder if any.
+            # Pre-populate encoder_cache from model_intermediate_buffer (decoupled pipeline).
+            _has_precomputed_embeds = False
+            if _has_cache:
+                req_needs_mm: list[str] = []
+                req_mm_ok: list[str] = []
+                for req_id in list(self.input_batch.req_ids):
+                    req_state = self.requests.get(req_id)
+                    if req_state is None:
+                        continue
+                    _mm_features = req_state.mm_features
+                    if not _mm_features:
+                        continue  # text-only, no encoder needed
+                    req_needs_mm.append(req_id)
+                    buf = self.model_intermediate_buffer.get(req_id, {})
+                    embed_payload = buf.get("embed", {}) if isinstance(buf, dict) else {}
+                    meta_payload = buf.get("meta", {}) if isinstance(buf, dict) else {}
+                    encoder_items = embed_payload.get("encoder") if isinstance(embed_payload, dict) else None
+                    encoder_modalities = (
+                        meta_payload.get("encoder_modalities") if isinstance(meta_payload, dict) else None
+                    )
+
+                    # ``encoder_embeddings`` was the old, untyped flat tensor.
+                    # Keep it only for old in-flight requests; newly emitted
+                    # decoupled payloads use per-item embeddings plus modality
+                    # labels so a mixed prompt can be restored in placeholder
+                    # order rather than encoder execution order.
+                    if encoder_items is None:
+                        legacy = buf.get("encoder_embeddings", None)
+                        if isinstance(legacy, torch.Tensor):
+                            encoder_items = [legacy]
+                            encoder_modalities = None
+                    if not isinstance(encoder_items, list) or not encoder_items:
+                        logger.info("[EMBED_CACHE_GATE] encoder payload missing for req=%s", req_id)
+                        continue
+
+                    sorted_mf = sorted(_mm_features, key=lambda f: f.mm_position.offset)
+                    if isinstance(encoder_modalities, list) and len(encoder_modalities) == len(encoder_items):
+                        queues: dict[str, list[torch.Tensor]] = {}
+                        valid = True
+                        for modality, item in zip(encoder_modalities, encoder_items):
+                            if not isinstance(modality, str) or not isinstance(item, torch.Tensor):
+                                valid = False
+                                break
+                            queues.setdefault(modality, []).append(item)
+                        ordered_items: list[torch.Tensor] = []
+                        if valid:
+                            for mf in sorted_mf:
+                                queue = queues.get(mf.modality, [])
+                                if not queue:
+                                    valid = False
+                                    break
+                                ordered_items.append(queue.pop(0))
+                        if valid and any(queues.values()):
+                            valid = False
+                        if not valid:
+                            logger.warning(
+                                "[EMBED_CACHE_GATE] modality/item mismatch for req=%s "
+                                "(features=%s labels=%s)", req_id,
+                                [mf.modality for mf in sorted_mf], encoder_modalities,
+                            )
+                            continue
+                    else:
+                        # Legacy flat payload: retain the prior contiguous-slice
+                        # behavior, which cannot safely reorder mixed modalities.
+                        if len(encoder_items) != 1 or not isinstance(encoder_items[0], torch.Tensor):
+                            logger.warning("[EMBED_CACHE_GATE] invalid legacy encoder payload for req=%s", req_id)
+                            continue
+                        flat = encoder_items[0]
+                        ordered_items = []
+                        pos = 0
+                        for mf in sorted_mf:
+                            length = mf.mm_position.length
+                            ordered_items.append(flat[pos : pos + length])
+                            pos += length
+                        if pos != flat.shape[0]:
+                            logger.warning("[EMBED_CACHE_GATE] legacy embedding length mismatch for req=%s", req_id)
+                            continue
+
+                    if any(item.shape[0] != mf.mm_position.length for item, mf in zip(ordered_items, sorted_mf)):
+                        logger.warning("[EMBED_CACHE_GATE] encoder item lengths do not match prompt placeholders for req=%s", req_id)
+                        continue
+                    for item, mf in zip(ordered_items, sorted_mf):
+                        self.encoder_cache[mf.identifier] = item.to(device=self.device, dtype=self.dtype)
+                    # # [DEBUG] Log pre-populated encoder item stats
+                    # for item, mf in zip(ordered_items, sorted_mf):
+                    #     logger.info("[DBG_CACHE] req=%s pre-pop %s mm_hash=%s shape=%s mean=%s std=%s",
+                    #                 req_id, mf.modality, mf.identifier[:16],
+                    #                 item.shape, item.float().mean().item(), item.float().std().item())
+                    logger.debug("Pre-populated %d decoupled encoder items for req=%s", len(sorted_mf), req_id)
+                    req_mm_ok.append(req_id)
+                # Only skip _execute_mm_encoder when EVERY multi-modal request
+                # had its encoder_cache populated from connector data.
+                _has_precomputed_embeds = (
+                    len(req_needs_mm) > 0 and len(req_mm_ok) == len(req_needs_mm)
+                )
+            # Run the multimodal encoder if no pre-computed embeddings.
             with self.maybe_get_ec_connector_output(
                 scheduler_output,
                 encoder_cache=self.encoder_cache,
             ) as ec_connector_output:
-                self._execute_mm_encoder(scheduler_output)
+                if not _has_precomputed_embeds:
+                    self._execute_mm_encoder(scheduler_output)
                 mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
@@ -1475,6 +1856,32 @@ class OmniGPUModelRunner(GPUModelRunner):
                 **self._init_model_kwargs(),
                 **self._extract_mm_kwargs(scheduler_output),
             }
+
+            # [Decoupled encoder] forward raw multimodal data to model.forward.
+            # Encoder stages (audio_encoder, visual_encoder) lack
+            # _cached_encoder_embeddings so _has_cache is False here.  The parent's
+            # _extract_mm_kwargs is gated by is_multimodal_raw_input_only_model
+            # which is False for the decoupled model, so we must inject the raw
+            # inputs (input_audio_features, pixel_values, …) into model_kwargs
+            # manually.  Without this the encoder's forward → embed_multimodal()
+            # receives empty kwargs and produces no output.
+            if not _has_cache:
+                _raw_items: list[tuple[str, Any]] = []
+                for _req_id in self.input_batch.req_ids:
+                    _req_state = self.requests.get(_req_id)
+                    if _req_state is None:
+                        continue
+                    for _mf in _req_state.mm_features:
+                        if _mf.data is not None:
+                            _raw_items.append((_mf.modality, _mf.data))
+                if _raw_items:
+                    from vllm.multimodal.utils import group_and_batch_mm_kwargs
+                    for _, _, _batch in group_and_batch_mm_kwargs(
+                        _raw_items,
+                        device=self.device,
+                        pin_memory=self.pin_memory,
+                    ):
+                        model_kwargs.update(_batch)
         elif self.enable_prompt_embeds and is_first_rank:
             # Get the input embeddings for the tokens that are not input embeds,
             # then put them into the appropriate positions.
@@ -1565,7 +1972,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # custom_process_input_func codec, so talker_preprocess reads
                 # the full thinker payload.
                 self._sync_local_stage_payloads()
-
         if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
             preprocess_device = input_ids.device if input_ids is not None else inputs_embeds.device
             self._maybe_run_batch_preprocess(self.input_batch.req_ids, preprocess_device)

@@ -42,6 +42,10 @@ class Embeddings(TypedDict, total=False):
     speech_token: torch.Tensor
     embedding: torch.Tensor
     thinker_reply: torch.Tensor
+    # Per-item outputs of decoupled multimodal encoders.  Keep these as a
+    # list: item boundaries are needed to place each embedding at its original
+    # multimodal placeholder in the Thinker prompt.
+    encoder: list[torch.Tensor]
 
 
 class Codes(TypedDict, total=False):
@@ -81,6 +85,9 @@ class OmniPayloadMeta(TypedDict, total=False):
     ref_context_request_id: str
     ref_context_included: bool
     talker_prefill_offset: int
+    # Parallel to ``embed.encoder``. Values are ``audio``, ``image`` or
+    # ``video`` and let the consumer restore prompt order across encoders.
+    encoder_modalities: list[str]
 
 
 class OmniPayload(TypedDict, total=False):
@@ -129,6 +136,7 @@ class EmbeddingsStruct(_StructBase):
     speech_token: torch.Tensor | None = None
     embedding: torch.Tensor | None = None
     thinker_reply: torch.Tensor | None = None
+    encoder: list[torch.Tensor] | None = None
 
 
 class CodesStruct(_StructBase):
@@ -168,6 +176,7 @@ class MetaStruct(_StructBase):
     ref_context_request_id: str | None = None
     ref_context_included: bool | None = None
     talker_prefill_offset: int | None = None
+    encoder_modalities: list[str] | None = None
     codec_chunk_frames: int | None = None
     codec_left_context_frames: int | None = None
     code_flat_numel: int | None = None
@@ -302,6 +311,14 @@ def flatten_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 if qual == "layers" and key == "hidden_states" and isinstance(val, dict):
                     for layer_idx, tensor in val.items():
                         flat[f"hidden_states.layer_{layer_idx}"] = tensor
+                elif key == "embed" and qual == "encoder" and isinstance(val, list) and all(
+                    isinstance(item, torch.Tensor) for item in val
+                ):
+                    # AdditionalInformationPayload carries one tensor per
+                    # entry.  Preserve encoder-item boundaries rather than
+                    # serializing a Python list of tensors as list_data.
+                    for item_idx, tensor in enumerate(val):
+                        flat[f"embed.encoder.{item_idx}"] = tensor
                 else:
                     flat[f"{key}.{qual}"] = val
         else:
@@ -324,6 +341,16 @@ def unflatten_payload(flat: dict[str, Any]) -> dict[str, Any]:
                 layers = sub.setdefault("layers", {})
                 layer_idx = int(qualifier[len("layer_") :])
                 layers[layer_idx] = value
+            elif type_key == "embed" and qualifier.startswith("encoder."):
+                index_str = qualifier[len("encoder.") :]
+                if index_str.isdigit():
+                    encoder_items = sub.setdefault("encoder", [])
+                    item_idx = int(index_str)
+                    while len(encoder_items) <= item_idx:
+                        encoder_items.append(None)
+                    encoder_items[item_idx] = value
+                else:
+                    sub[qualifier] = value
             else:
                 sub[qualifier] = value
         else:

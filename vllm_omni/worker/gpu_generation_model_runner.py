@@ -56,6 +56,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         # Mirrors the init allowlist in gpu_ar_model_runner.py.
         _OMNI_CONNECTOR_INIT_ARCHS = {
             "Qwen3OmniMoeForConditionalGeneration",
+            "Qwen3OmniMoeDecoupledForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
             "CovoAudioForConditionalGeneration",
             "MiMoAudioModel",
@@ -304,6 +305,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 num_tokens_padded,
                 intermediate_tensors,
             )
+            logger.debug("input_ids: %s, inputs_embeds: %s, positions: %s",
+                          input_ids.shape if input_ids is not None else None,
+                          inputs_embeds.shape if inputs_embeds is not None else None,
+                          positions.shape if positions is not None else None)
             # [Omni] Pass token counts per request for code2wav output slicing
             model_kwargs["seq_token_counts"] = tokens
 
@@ -432,21 +437,67 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 )
         elif isinstance(multimodal_outputs, dict):
             num_reqs = self.input_batch.num_reqs
-            for i in range(num_reqs):
-                mm_payload = {}
-                for key, out in multimodal_outputs.items():
-                    if isinstance(out, list):
-                        if len(out) != num_reqs:
+            embed = multimodal_outputs.get("embed")
+            meta = multimodal_outputs.get("meta")
+            encoder_items = embed.get("encoder") if isinstance(embed, dict) else None
+            encoder_modalities = meta.get("encoder_modalities") if isinstance(meta, dict) else None
+            if isinstance(encoder_items, list) and isinstance(encoder_modalities, list):
+                # Decoupled Qwen3-Omni encoders return one tensor per original
+                # multimodal item, not one tensor per request.  Re-bucket by
+                # request and modality before producing pooler_output.  This
+                # preserves item boundaries through the SHM connector and is
+                # required when a batch contains different modality mixes.
+                if len(encoder_items) != len(encoder_modalities) or not all(
+                    isinstance(item, torch.Tensor) for item in encoder_items
+                ):
+                    raise ValueError("Malformed decoupled encoder payload: items and modality labels must align")
+                model_stage = getattr(self.model, "model_stage", None)
+                expected_modalities = ("audio",) if model_stage == "audio_encoder" else ("audio", "image", "video")
+                queues: dict[str, list[torch.Tensor]] = {}
+                for modality, item in zip(encoder_modalities, encoder_items):
+                    if modality not in expected_modalities:
+                        raise ValueError(f"Unexpected encoder modality {modality!r} from stage {model_stage!r}")
+                    queues.setdefault(modality, []).append(item)
+                for req_id in self.input_batch.req_ids:
+                    req_state = self.requests.get(req_id)
+                    features = getattr(req_state, "mm_features", None) or []
+                    request_items: list[torch.Tensor] = []
+                    request_modalities: list[str] = []
+                    for modality in expected_modalities:
+                        count = sum(feature.modality == modality for feature in features)
+                        queue = queues.get(modality, [])
+                        if len(queue) < count:
                             raise ValueError(
-                                f"Multimodal output list for key '{key}' has length {len(out)} "
-                                f"but expected {num_reqs} (one entry per request)."
+                                f"Missing {modality} encoder embeddings for request {req_id}: "
+                                f"need {count}, have {len(queue)}"
                             )
-                        mm_payload[key] = out[i].detach().to("cpu").contiguous()
-                    elif isinstance(out, torch.Tensor):
-                        mm_payload[key] = out.detach().to("cpu").contiguous()
-                    else:
-                        logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
-                pooler_output.append(mm_payload)
+                        for _ in range(count):
+                            request_items.append(queue.pop(0).detach().to("cpu").contiguous())
+                            request_modalities.append(modality)
+                    pooler_output.append(
+                        {
+                            "embed": {"encoder": request_items},
+                            "meta": {"encoder_modalities": request_modalities},
+                        }
+                    )
+                if any(queues.values()):
+                    raise ValueError("Decoupled encoder emitted more embeddings than prompt placeholders")
+            else:
+                for i in range(num_reqs):
+                    mm_payload = {}
+                    for key, out in multimodal_outputs.items():
+                        if isinstance(out, list):
+                            if len(out) != num_reqs:
+                                raise ValueError(
+                                    f"Multimodal output list for key '{key}' has length {len(out)} "
+                                    f"but expected {num_reqs} (one entry per request)."
+                                )
+                            mm_payload[key] = out[i].detach().to("cpu").contiguous()
+                        elif isinstance(out, torch.Tensor):
+                            mm_payload[key] = out.detach().to("cpu").contiguous()
+                        else:
+                            logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
+                    pooler_output.append(mm_payload)
         else:
             raise RuntimeError("Unsupported diffusion output type")
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.

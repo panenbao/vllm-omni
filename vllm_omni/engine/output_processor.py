@@ -267,7 +267,10 @@ class OmniRequestState(RequestState):
         # Inter-stage processors need the full cumulative token sequence.
         # In DELTA mode, base_output.token_ids only has the latest step's
         # tokens, so we always store a cumulative copy here.
-        base_output.cumulative_token_ids = list(self.detokenizer.output_token_ids)
+        if self.detokenizer is not None:
+            base_output.cumulative_token_ids = list(self.detokenizer.output_token_ids)
+        else:
+            base_output.cumulative_token_ids = list(token_ids)
 
         if not hasattr(base_output, "multimodal_output"):
             setattr(base_output, "multimodal_output", {})
@@ -426,7 +429,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             req_state = self.request_states.get(eco.request_id)
             if req_state is None or not isinstance(req_state, OmniRequestState):
                 continue
-            if eco.pooling_output is not None and req_state.detokenizer is not None:
+            if eco.pooling_output is not None:
                 mm_type = (getattr(eco, "output_type", self.engine_core_output_type) or "").lower()
                 req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
                 # Force text path in base processor for multimodal outputs.

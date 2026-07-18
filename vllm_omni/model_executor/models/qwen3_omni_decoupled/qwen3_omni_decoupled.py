@@ -36,6 +36,7 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
+from vllm_omni.utils.nvtx import nvtx_mark, nvtx_range
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import (
     add_prefix_to_loaded_weights,

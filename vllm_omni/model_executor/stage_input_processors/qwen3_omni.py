@@ -29,6 +29,7 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_speaker_from_prompt,
     extract_speaker_from_request,
 )
+from vllm_omni.utils.nvtx import nvtx_range
 
 logger = logging.getLogger(__name__)
 
@@ -443,7 +444,7 @@ def thinker2talker_async_chunk(
     2. Split hidden states into: prompt embeddings + generated embeddings
     3. Package for talker with additional information
     """
-
+    logger.debug("thinker2talker_async_chunk: processing pooling_output for req=%s, is_finished=%s", getattr(request, "request_id", None), is_finished)
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
     if not isinstance(pooling_output, dict):
@@ -532,6 +533,7 @@ def thinker2talker_full_payload(
     pooling_output: dict[str, Any],
     request: OmniEngineCoreRequest,
 ) -> dict[str, Any] | None:
+    logger.debug("thinker2talker_full_payload: processing pooling_output for req=%s", getattr(request, "request_id", None))
     """Pack complete thinker output for the non-async connector path."""
     rid = getattr(request, "request_id", None)
     if not isinstance(pooling_output, dict):
@@ -632,6 +634,7 @@ def thinker2talker(
     Returns:
         List of OmniTokensPrompt for talker stage
     """
+    logger.debug("thinker2talker: processing %d thinker outputs", len(source_outputs))
     thinker_outputs = source_outputs
     talker_inputs: list[OmniTokensPrompt] = []
 
@@ -739,6 +742,7 @@ def thinker2talker_token_only(
     voice selection (regression discovered on Buildkite 9668:
     ``test_speaker_002[default]`` lost the preset voice).
     """
+    logger.debug("thinker2talker_token_only: processing %d thinker outputs", len(source_outputs))
     talker_inputs: list[OmniTokensPrompt] = []
     for i, thinker_output in enumerate(source_outputs):
         output = thinker_output.outputs[0]

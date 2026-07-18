@@ -37,6 +37,7 @@ from vllm_omni.distributed.omni_coordinator import (
     RandomBalancer,
     ReplicaStatus,
 )
+from vllm_omni.utils.nvtx import nvtx_mark, nvtx_range
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.messages import (
@@ -101,6 +102,10 @@ def build_engine_core_request_from_tokens(
         prompt.get("additional_information"),
         log_prefix=f"build_engine_core_request_from_tokens req={request_id}",
     )
+    if prompt.get("additional_information") is not None:
+        logger.info("[BUILD_REQ] req=%s additional_info keys=%s payload_none=%s",
+                    request_id, list(prompt["additional_information"].keys()),
+                    additional_info_payload is None)
 
     return OmniEngineCoreRequest(
         request_id=request_id,
@@ -448,57 +453,61 @@ class Orchestrator:
 
     async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
         """Handle an add_request message from the main thread."""
-        stage_id = 0
-        request_id = msg.request_id
-        prompt = msg.prompt
-        original_prompt = msg.original_prompt
-        sampling_params_list = msg.sampling_params_list
-        if not sampling_params_list:
-            raise ValueError(f"Missing sampling params for stage 0. Got {len(sampling_params_list)} stage params.")
-        final_stage_id = msg.final_stage_id
-        final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
+        with nvtx_range("orchestrator_handle_add_request"):
+            # TODO: 需要根据输入模态来选择stage_id，当前只支持stage_id=0
+            stage_id = 0
+            request_id = msg.request_id
+            prompt = msg.prompt
+            original_prompt = msg.original_prompt
+            sampling_params_list = msg.sampling_params_list
+            if not sampling_params_list:
+                raise ValueError(f"Missing sampling params for stage 0. Got {len(sampling_params_list)} stage params.")
+            final_stage_id = msg.final_stage_id
+            final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
 
-        logger.debug(
-            "[Orchestrator] _handle_add_request: stage=%s req=%s "
-            "prompt_type=%s original_prompt_type=%s final_stage=%s "
-            "num_sampling_params=%d",
-            stage_id,
-            request_id,
-            type(prompt).__name__,
-            type(original_prompt).__name__,
-            final_stage_id,
-            len(sampling_params_list),
-        )
+            logger.debug(
+                "[Orchestrator] _handle_add_request: stage=%s req=%s "
+                "prompt_type=%s original_prompt_type=%s final_stage=%s "
+                "num_sampling_params=%d",
+                stage_id,
+                request_id,
+                type(prompt).__name__,
+                type(original_prompt).__name__,
+                final_stage_id,
+                len(sampling_params_list),
+            )
 
-        req_state = OrchestratorRequestState(
-            request_id=request_id,
-            prompt=original_prompt,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=final_stage_id,
-            final_output_stage_ids=final_output_stage_ids,
-            request_timestamp=float(msg.request_timestamp or _time.time()),
-            mm_features=getattr(prompt, "mm_features", None),
-        )
-        self.request_states[request_id] = req_state
-        if self._running_counter is not None:
-            self._running_counter.increment()
-        req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
-        req_state.stage_submit_ts[stage_id] = _time.time()
-        enqueue_ts = msg.enqueue_ts
-        if enqueue_ts > 0:
-            req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
-        preprocess_ms = msg.preprocess_ms
-        if preprocess_ms > 0:
-            req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
-        await self.stage_pools[stage_id].submit_initial(
-            request_id,
-            req_state,
-            prompt,
-            prompt_text=msg.output_prompt_text,
-        )
+            req_state = OrchestratorRequestState(
+                request_id=request_id,
+                prompt=original_prompt,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=final_output_stage_ids,
+                request_timestamp=float(msg.request_timestamp or _time.time()),
+                mm_features=getattr(prompt, "mm_features", None),
+            )
+            self.request_states[request_id] = req_state
+            if self._running_counter is not None:
+                self._running_counter.increment()
+            req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
+            req_state.stage_submit_ts[stage_id] = _time.time()
+            enqueue_ts = msg.enqueue_ts
+            if enqueue_ts > 0:
+                req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
+            preprocess_ms = msg.preprocess_ms
+            if preprocess_ms > 0:
+                req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
+            await self.stage_pools[stage_id].submit_initial(
+                request_id,
+                req_state,
+                prompt,
+                prompt_text=msg.output_prompt_text,
+            )
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
+            # Encoder stages 0→1 are submitted with full mm_features via orchestrator
+            # forwarding. Only prewarm stages 2+ (thinker/talker/code2wav) for async_chunk.
+            if self.async_chunk and stage_id == 0 and final_stage_id >= 2:
+                await self._prewarm_async_chunk_stages(request_id, prompt, req_state, start_from=3)
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
         """Handle a streaming_update message for an existing request."""
@@ -540,8 +549,8 @@ class Orchestrator:
             prompt_text=msg.output_prompt_text,
         )
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            await self._prewarm_async_chunk_stages(request_id, request, req_state)
+        if self.async_chunk and stage_id == 0 and final_stage_id >= 2:
+            await self._prewarm_async_chunk_stages(request_id, request, req_state, start_from=3)
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
@@ -666,6 +675,10 @@ class Orchestrator:
         """Poll stage pools and route logical outputs."""
         while not self._shutdown_event.is_set():
             idle = True
+            # _active_reqs = {rid: s.finished_final_output_stage_ids
+            #                 for rid, s in self.request_states.items()}
+            # if _active_reqs:
+            #     logger.info("[ORCH_LOOP] active_reqs=%s", _active_reqs)
             for stage_id in range(self.num_stages):
                 pool = self.stage_pools[stage_id]
                 for replica_id in pool.live_replica_ids():
@@ -681,10 +694,18 @@ class Orchestrator:
                         await self._handle_processed_outputs(stage_id, replica_id, [output])
                         idle = False
                     else:
+                        _pool_model_stage = getattr(pool.stage_client, "model_stage", None)
                         try:
                             raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
                             if raw_outputs is None:
                                 continue
+
+                            # # ==== DEBUG: 每个 stage 的原始输出 ====
+                            # for eco in raw_outputs.outputs:
+                            #     logger.info("[ORCH_LOOP] stage=%s(%s) req=%s polled finished=%s pooling=%s",
+                            #                 stage_id, _pool_model_stage, getattr(eco, "request_id", None),
+                            #                 getattr(eco, "finish_reason", None),
+                            #                 getattr(eco, "pooling_output", None) is not None)
 
                             await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
                             for eco in raw_outputs.outputs:
@@ -772,6 +793,14 @@ class Orchestrator:
         pool = self.stage_pools[stage_id]
         for output in outputs:
             req_state = self.request_states.get(output.request_id)
+
+            # ==== DEBUG: orchestrator 收到 stage 输出 ====
+            _mm = getattr(output, "multimodal_output", None)
+            logger.info("[ORCH_OUT] stage=%s replica=%s req=%s finished=%s "
+                        "final_output=%s async_chunk=%s multimodal=%s",
+                        stage_id, replica_id, output.request_id, output.finished,
+                        pool.final_output, self.async_chunk,
+                        list(_mm.keys()) if isinstance(_mm, dict) else type(_mm).__name__ if _mm is not None else None)
             if req_state is None:
                 logger.warning(
                     "[Orchestrator] Dropping output for unknown req %s at stage-%s (known reqs: %s)",
@@ -931,11 +960,19 @@ class Orchestrator:
                 self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
             req_state.pd_prefill_multimodal_output = getattr(output, "multimodal_output", None)
 
+        # Encoder stages (0→1) are forwarded by the orchestrator with full mm_features.
+        # Async-chunk streaming (2→3→4) uses connector-based transfer.
+        _orchestrator_forwards = not self.async_chunk or stage_id <= 1
+        _next_submitted = self._next_stage_already_submitted(stage_id, req_state)
+        logger.info("[ROUTE] stage=%s req=%s finished=%s final_stage=%s orch_fwd=%s next_submitted=%s stream=%s",
+                    stage_id, req_id, finished, req_state.final_stage_id,
+                    _orchestrator_forwards, _next_submitted, req_state.streaming.enabled)
+        # Encoder stages (0→1) always forward (via submit_update when prewarmed).
         if (
             (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
             and stage_id < req_state.final_stage_id
-            and not self.async_chunk
-            and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
+            and _orchestrator_forwards
+            and (not _next_submitted or req_state.streaming.enabled or stage_id <= 1)
         ):
             if (
                 finished
@@ -1296,10 +1333,24 @@ class Orchestrator:
 
         # Build and submit requests for each input
         for next_input in next_inputs:
-            # Only AR thinker stages consume encoder mm_features; downstream
-            # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
+            # Encoder stages (audio_encoder, visual_encoder) need mm_features for
+            # their modality inputs. Thinker also needs them for multimodal embeddings.
+            # Downstream (talker/code2wav) must NOT see them (avoids encoder-cache misses).
             model_stage = getattr(next_client, "model_stage", None)
-            mm_features = req_state.mm_features if model_stage == "thinker" else None
+            mm_features = req_state.mm_features if model_stage and model_stage.startswith(("thinker", "visual_", "audio_")) else None
+            logger.info("[FWD] stage=%s->%s model_stage=%s mm_features=%s",
+                        src_stage_id, next_logical, model_stage,
+                        len(mm_features) if mm_features else None)
+            # ==== DEBUG: next_input 内容 ====
+            _add_info = (next_input.get("additional_information") if isinstance(next_input, dict)
+                         else getattr(next_input, "additional_information", None))
+            _pt_ids = (next_input.get("prompt_token_ids") if isinstance(next_input, dict)
+                       else getattr(next_input, "prompt_token_ids", None))
+            logger.info("[FWD_DATA] stage=%s->%s req=%s pt_len=%s add_info_keys=%s",
+                        src_stage_id, next_logical, req_id,
+                        len(_pt_ids) if _pt_ids else 0,
+                        list(_add_info.keys()) if isinstance(_add_info, dict) else str(type(_add_info).__name__))
+
             request = build_engine_core_request_from_tokens(
                 request_id=req_id,
                 prompt=next_input,
@@ -1311,9 +1362,15 @@ class Orchestrator:
 
             request.external_req_id = request.request_id
             if already_submitted:
+                logger.info("[FWD] submit_update stage=%s->%s req=%s",
+                            src_stage_id, next_logical, req_id)
                 await next_pool.submit_update(req_id, req_state, request)
             else:
+                logger.info("[FWD] submit_initial stage=%s->%s req=%s",
+                            src_stage_id, next_logical, req_id)
                 await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+            logger.info("[FWD] submit done stage=%s->%s req=%s",
+                        src_stage_id, next_logical, req_id)
 
         req_state.stage_submit_ts[next_logical] = _time.time()
         _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
@@ -1331,9 +1388,15 @@ class Orchestrator:
         request_id: str,
         stage0_request: Any,
         req_state: OrchestratorRequestState,
+        start_from: int = 1,
     ) -> None:
-        """Pre-submit downstream stages for async-chunk mode."""
-        if req_state.final_stage_id <= 0:
+        """Pre-submit downstream stages (start_from and above) for async-chunk mode.
+
+        Encoder stages (0→1) are submitted with full mm_features via orchestrator
+        forwarding, so they are NOT prewarmed. Only stages >= 2 (thinker/talker/code2wav)
+        are prewarmed for streaming chunk transfer.
+        """
+        if start_from > req_state.final_stage_id:
             return
 
         prompt_token_ids = getattr(stage0_request, "prompt_token_ids", None)
@@ -1344,7 +1407,7 @@ class Orchestrator:
             )
             return
 
-        for next_stage_id in range(1, req_state.final_stage_id + 1):
+        for next_stage_id in range(start_from, req_state.final_stage_id + 1):
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
 

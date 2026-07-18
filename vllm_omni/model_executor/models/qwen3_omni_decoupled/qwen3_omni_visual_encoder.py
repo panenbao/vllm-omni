@@ -30,6 +30,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3Omni_VisionTransformer,
 )
+from vllm_omni.utils.nvtx import nvtx_range
 
 logger = init_logger(__name__)
 
@@ -41,7 +42,8 @@ class Qwen3OmniMoeVisualEncoderStage(nn.Module):
     from the Qwen3-Omni checkpoint.
 
     Input: pixel_values (+ image_grid_thw for images, pixel_values_videos + video_grid_thw for videos)
-    Output: OmniOutput with multimodal_outputs["encoder_embeddings"] = [visual_embeddings]
+    Output: ``embed.encoder`` items labelled ``image`` / ``video``.  It also
+    carries the upstream audio items through to the Thinker stage.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -114,21 +116,25 @@ class Qwen3OmniMoeVisualEncoderStage(nn.Module):
         sizes = grid_thw.prod(-1) // merge_size // merge_size
         return list(video_embeds.split(sizes.tolist()))
 
-    def embed_multimodal(self, **kwargs) -> list[torch.Tensor]:
-        """Process multimodal inputs - handles image and video.
-
-        Falls back to a dummy embedding when multimodal kwargs are present
-        but no image/video input is found (e.g. audio-only profile run).
-        """
+    def _embed_multimodal_with_modalities(self, **kwargs) -> tuple[list[torch.Tensor], list[str]]:
+        """Process multimodal inputs - handles image and video."""
         embeddings: list[torch.Tensor] = []
+        modalities: list[str] = []
         image_input = self._parse_image_input(**kwargs)
         if image_input is not None:
-            embeddings.extend(self._process_image(image_input))
+            image_embeddings = self._process_image(image_input)
+            embeddings.extend(image_embeddings)
+            modalities.extend(["image"] * len(image_embeddings))
         video_input = self._parse_video_input(**kwargs)
         if video_input is not None:
-            embeddings.extend(self._process_video(video_input))
-        if not embeddings and any(v is not None for v in kwargs.values()):
-            embeddings.append(torch.zeros(1, 2048, dtype=torch.bfloat16))
+            video_embeddings = self._process_video(video_input)
+            embeddings.extend(video_embeddings)
+            modalities.extend(["video"] * len(video_embeddings))
+        return embeddings, modalities
+
+    def embed_multimodal(self, **kwargs) -> list[torch.Tensor]:
+        """vLLM multimodal hook; metadata is carried by ``forward`` only."""
+        embeddings, _ = self._embed_multimodal_with_modalities(**kwargs)
         return embeddings
 
     def forward(
@@ -139,16 +145,45 @@ class Qwen3OmniMoeVisualEncoderStage(nn.Module):
         **kwargs,
     ) -> OmniOutput:
         """Forward pass: process image/video and return embeddings."""
-        visual_embeddings = self.embed_multimodal(**kwargs)
-        if not visual_embeddings:
+        with nvtx_range("omni_decoupled_forward_visual_encoder"):
+            visual_embeddings, visual_modalities = self._embed_multimodal_with_modalities(**kwargs)
+
+            # Stage 0 may have produced audio embeddings.  Stage 1 must carry
+            # them forward together with its visual results; otherwise audio
+            # conditioning is silently lost before the Thinker stage.
+            upstream_embeddings: list[torch.Tensor] = []
+            upstream_modalities: list[str] = []
+            for info in kwargs.get("runtime_additional_information") or kwargs.get("model_intermediate_buffer") or []:
+                if not isinstance(info, dict):
+                    continue
+                embed = info.get("embed", {})
+                meta = info.get("meta", {})
+                values = embed.get("encoder", []) if isinstance(embed, dict) else []
+                labels = meta.get("encoder_modalities", []) if isinstance(meta, dict) else []
+                if not values:
+                    values = info.get("embed.encoder", [])
+                if not labels:
+                    labels = info.get("meta.encoder_modalities", [])
+                if isinstance(values, torch.Tensor):
+                    values = [values]
+                if isinstance(values, list) and len(values) == len(labels):
+                    upstream_embeddings.extend(v for v in values if isinstance(v, torch.Tensor))
+                    upstream_modalities.extend(labels)
+
+            encoder_embeddings = upstream_embeddings + visual_embeddings
+            encoder_modalities = upstream_modalities + visual_modalities
+            logger.debug("Decoupled visual stage produced %d encoder items", len(encoder_embeddings))
+            # # [DEBUG] Stage-1 send: per-modality embed stats
+            # for i, (emb, mod) in enumerate(zip(encoder_embeddings, encoder_modalities)):
+            #     logger.info("[DBG_SEND] Stage-1 %s[%d] shape=%s mean=%s std=%s",
+            #                 mod, i, emb.shape, emb.float().mean().item(), emb.float().std().item())
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs=None,
+                multimodal_outputs={
+                    "embed": {"encoder": encoder_embeddings},
+                    "meta": {"encoder_modalities": encoder_modalities},
+                },
             )
-        return OmniOutput(
-            text_hidden_states=None,
-            multimodal_outputs={"encoder_embeddings": visual_embeddings},
-        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load only visual transformer weights from the checkpoint.

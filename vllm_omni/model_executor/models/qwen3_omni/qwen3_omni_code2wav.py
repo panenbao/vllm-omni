@@ -28,6 +28,7 @@ from vllm.model_executor.models.utils import (  # type: ignore
 )
 
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
+from vllm_omni.utils.nvtx import nvtx_range
 
 logger = init_logger(__name__)
 
@@ -185,33 +186,34 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         Returns:
             waveform: [batch, 1, waveform_len] - Audio waveform clipped to [-1, 1]
         """
-        if codes.shape[1] != self.config.num_quantizers:
-            raise ValueError(f"Expected {self.config.num_quantizers} layers of codes, got {codes.shape[1]}")
+        with nvtx_range("omni_decoupled_forward_code2wav"):
+            if codes.shape[1] != self.config.num_quantizers:
+                raise ValueError(f"Expected {self.config.num_quantizers} layers of codes, got {codes.shape[1]}")
 
-        # Stage 1: Code Embedding
-        # Add offset to separate layer vocabularies, then embed and average
-        hidden = self.code_embedding(codes + self.code_offset).mean(1)
-        # Shape: [batch, seq_len, hidden_size]
+            # Stage 1: Code Embedding
+            # Add offset to separate layer vocabularies, then embed and average
+            hidden = self.code_embedding(codes + self.code_offset).mean(1)
+            # Shape: [batch, seq_len, hidden_size]
 
-        # Stage 2: Pre-Transformer (add temporal context)
-        hidden = self.pre_transformer(inputs_embeds=hidden).last_hidden_state
-        # Shape: [batch, seq_len, hidden_size]
+            # Stage 2: Pre-Transformer (add temporal context)
+            hidden = self.pre_transformer(inputs_embeds=hidden).last_hidden_state
+            # Shape: [batch, seq_len, hidden_size]
 
-        # Stage 3: Upsampling
-        hidden = hidden.permute(0, 2, 1)  # [batch, hidden_size, seq_len]
-        for blocks in self.upsample:
-            for block in blocks:
-                hidden = block(hidden)
-        # Shape: [batch, hidden_size, seq_len * upsample_factor]
+            # Stage 3: Upsampling
+            hidden = hidden.permute(0, 2, 1)  # [batch, hidden_size, seq_len]
+            for blocks in self.upsample:
+                for block in blocks:
+                    hidden = block(hidden)
+            # Shape: [batch, hidden_size, seq_len * upsample_factor]
 
-        # Stage 4: Decoder (progressive upsampling to waveform)
-        wav = hidden
-        for block in self.decoder:
-            wav = block(wav)
-        # Shape: [batch, 1, waveform_len]
+            # Stage 4: Decoder (progressive upsampling to waveform)
+            wav = hidden
+            for block in self.decoder:
+                wav = block(wav)
+            # Shape: [batch, 1, waveform_len]
 
-        # Clamp to valid audio range
-        return wav.clamp(min=-1.0, max=1.0)
+            # Clamp to valid audio range
+            return wav.clamp(min=-1.0, max=1.0)
 
     def chunked_decode(
         self,

@@ -214,6 +214,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if result is None:
             return False
         payload_data, size = result
+        logger.info("[CHUNK_ADAPTER stage=%s] poll req=%s key=%s GOT DATA size=%s payload_type=%s",
+                    stage_id, req_id, connector_get_key, size, type(payload_data).__name__)
 
         if payload_data:
             # Update connector state
@@ -302,6 +304,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         external_req_id = request.external_req_id
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
+        logger.debug("[CHUNK_ADAPTER stage=%s] send req=%s key=%s", stage_id, external_req_id, connector_put_key)
         # Process payload in save_loop thread
         payload_data: OmniPayloadStruct | None = None
         if self.custom_process_next_stage_input_func:
