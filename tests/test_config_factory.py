@@ -1308,6 +1308,15 @@ class TestQwen3OmniPipeline:
         assert s.custom_process_input_func is not None
 
 
+class TestQwen3OmniDecoupledPipeline:
+    def test_thinker_lm_stops_on_text_eos(self):
+        s = _PIPELINE_REGISTRY["qwen3_omni_moe_decoupled"].get_stage(2)
+        assert s.model_stage == "thinker_lm"
+        assert s.execution_type == StageExecutionType.LLM_AR
+        assert s.owns_tokenizer is True
+        assert s.sampling_constraints["stop_token_ids"] == [151645]
+
+
 class TestQwen2_5OmniPipeline:
     def test_registered(self):
         p = _PIPELINE_REGISTRY.get("qwen2_5_omni")

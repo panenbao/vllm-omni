@@ -1363,17 +1363,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 cache.pop(req_id, None)
         for req_id, payload in staged.items():
             self._update_intermediate_buffer(req_id, payload)
-            # # [DEBUG] Log connector-delivered payload at sync time
-            # _embed = payload.get("embed", {}) if isinstance(payload, dict) else {}
-            # _meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
-            # _items = _embed.get("encoder", []) if isinstance(_embed, dict) else []
-            # _labels = _meta.get("encoder_modalities", []) if isinstance(_meta, dict) else []
-            # if _items and _labels and len(_items) == len(_labels):
-            #     for _i, (_emb, _mod) in enumerate(zip(_items, _labels)):
-            #         if isinstance(_emb, torch.Tensor):
-            #             logger.info("[DBG_SYNC] req=%s connector %s[%d] shape=%s mean=%s std=%s",
-            #                         req_id, _mod, _i, _emb.shape,
-            #                         _emb.float().mean().item(), _emb.float().std().item())
 
     def _build_model_kwargs_extra(self) -> dict:
         """Build extra keyword arguments passed to the model for this step."""
@@ -1384,11 +1373,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             model_kwargs_extra["model_intermediate_buffer"] = buffer_map
             # Backward compatible: also emit old name
             model_kwargs_extra["runtime_additional_information"] = buffer_map
-        except Exception as e:
-            logger.error(f"[OMNI DEBUG] Error building model_kwargs_extra: {e}")
-            import traceback
-
-            traceback.print_exc()
+        except Exception:
+            logger.exception("Failed to build model kwargs from intermediate stage payloads")
 
         if getattr(self.model_config, "has_sampling_extra_args", False):
             extra_args_list: list[dict] = []
@@ -1654,15 +1640,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 else:
                     mm_embeds_item = encoder_output[start_idx:end_idx]
 
-                # # [DEBUG] Log per-modality token-position range in the input sequence
-                # _seq_start = req_start_idx + max(0, start_pos - num_computed_tokens)
-                # _seq_end = req_start_idx + min(num_scheduled_tokens, start_pos + num_encoder_tokens - num_computed_tokens)
-                # logger.info("[POS_MAP] req=%s modality=%s seq_tokens=[%d:%d] mm_tokens=[%d:%d] mm_hash=%s",
-                #             req_id, mm_feature.modality,
-                #             _seq_start, _seq_end,
-                #             curr_embeds_start, curr_embeds_end,
-                #             mm_hash[:12])
-
                 req_start_pos = req_start_idx + start_pos - num_computed_tokens
                 # OR mask for overlapping mm_features (use_audio_in_video)
                 if is_embed is None:
@@ -1818,11 +1795,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                         continue
                     for item, mf in zip(ordered_items, sorted_mf):
                         self.encoder_cache[mf.identifier] = item.to(device=self.device, dtype=self.dtype)
-                    # # [DEBUG] Log pre-populated encoder item stats
-                    # for item, mf in zip(ordered_items, sorted_mf):
-                    #     logger.info("[DBG_CACHE] req=%s pre-pop %s mm_hash=%s shape=%s mean=%s std=%s",
-                    #                 req_id, mf.modality, mf.identifier[:16],
-                    #                 item.shape, item.float().mean().item(), item.float().std().item())
                     logger.debug("Pre-populated %d decoupled encoder items for req=%s", len(sorted_mf), req_id)
                     req_mm_ok.append(req_id)
                 # Only skip _execute_mm_encoder when EVERY multi-modal request

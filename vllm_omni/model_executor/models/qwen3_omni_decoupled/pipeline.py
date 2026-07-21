@@ -67,7 +67,15 @@ QWEN3_OMNI_DECOUPLED_PIPELINE = PipelineConfig(
             sync_process_input_func=f"{_DECOUPLED_PROC}.visual2thinker_token_only",
             custom_process_next_stage_input_func=(f"{_SHARED_PROC}.thinker2talker_full_payload"),
             async_chunk_process_next_stage_input_func=(f"{_SHARED_PROC}.thinker2talker_async_chunk"),
-            sampling_constraints={"detokenize": True},
+            # The thinker LM is not stage 0, so it does not inherit the
+            # checkpoint generation config through the stage-0 input
+            # processor.  Carry Qwen's text EOS explicitly; otherwise
+            # <|im_end|> is fed back into decode and the model loops through
+            # chat-template special tokens until max_tokens.
+            sampling_constraints={
+                "detokenize": True,
+                "stop_token_ids": [151645],
+            },
         ),
         # ── Stage 3: Talker ─────────────────────────────────────────
         StagePipelineConfig(

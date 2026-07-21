@@ -24,6 +24,10 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
     MultiModalEmbeddings,
 )
+from vllm.model_executor.models.qwen2_5_omni_thinker import (
+    check_interleaved_audio_video,
+    merge_interleaved_embeddings,
+)
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -102,6 +106,24 @@ class Qwen3OmniMoeLLMStage(nn.Module):
         self._cached_encoder_embeddings: list[torch.Tensor] | None = None
         self._accept_hidden_layer = getattr(config.talker_config, "accept_hidden_layer", 24)
 
+        # Deepstack buffer
+        _vision_cfg = getattr(thinker_config, "vision_config", None)
+        self._ds_idx = getattr(_vision_cfg, "deepstack_visual_indexes", None) if _vision_cfg else None
+        if self._ds_idx is not None:
+            self._ds_num_level = len(self._ds_idx)
+            self._ds_input_embeds: list[torch.Tensor] = [
+                torch.zeros(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    thinker_config.text_config.hidden_size,
+                )
+                for _ in range(self._ds_num_level)
+            ]
+            self._ds_input_embeds_num_tokens = 0
+        else:
+            self._ds_num_level = 0
+            self._ds_input_embeds = []
+            self._ds_input_embeds_num_tokens = 0
+
     def set_encoder_embeddings(self, embeddings: list[torch.Tensor] | None) -> None:
         """Set pre-computed encoder embeddings from upstream stages."""
         self._cached_encoder_embeddings = embeddings
@@ -120,6 +142,54 @@ class Qwen3OmniMoeLLMStage(nn.Module):
                                 dtype=torch.bfloat16)]
         return []
 
+    # ── Deepstack helpers (mirrors fused Qwen3OmniMoeThinker) ──────
+
+    def _ds_set_input_embeds(self, deepstack_input_embeds: torch.Tensor) -> None:
+        """Store deepstack input embeddings."""
+        if not self._ds_input_embeds:
+            return
+        num_tokens = deepstack_input_embeds.size(1)
+        if num_tokens > self._ds_input_embeds[0].size(0):
+            self._ds_resize(num_tokens)
+        for idx in range(self._ds_num_level):
+            self._ds_input_embeds[idx][:num_tokens].copy_(deepstack_input_embeds[idx])
+        self._ds_input_embeds_num_tokens = num_tokens
+
+    def _ds_resize(self, num_tokens: int) -> None:
+        for idx in range(self._ds_num_level):
+            new_buf = torch.zeros(num_tokens, self._ds_input_embeds[0].shape[-1],
+                                  dtype=self._ds_input_embeds[0].dtype,
+                                  device=self._ds_input_embeds[0].device)
+            new_buf[:self._ds_input_embeds[idx].size(0)] = self._ds_input_embeds[idx]
+            self._ds_input_embeds[idx] = new_buf
+
+    def _ds_get_input_embeds(self, num_tokens: int) -> IntermediateTensors | None:
+        """Get deepstack input embeddings as IntermediateTensors."""
+        if not self._ds_input_embeds:
+            return None
+        if num_tokens > self._ds_input_embeds[0].size(0):
+            self._ds_resize(num_tokens)
+        n_valid = self._ds_input_embeds_num_tokens
+        if num_tokens > n_valid:
+            for idx in range(self._ds_num_level):
+                self._ds_input_embeds[idx][n_valid:num_tokens].zero_()
+        return IntermediateTensors({
+            f"deepstack_input_embeds_{idx}": self._ds_input_embeds[idx][:num_tokens]
+            for idx in range(self._ds_num_level)
+        })
+
+    def _ds_clear(self, num_tokens: int) -> None:
+        """Zero out consumed deepstack entries."""
+        if not self._ds_input_embeds:
+            return
+        if self._ds_input_embeds_num_tokens == 0:
+            return
+        if num_tokens > 0:
+            clear_len = min(num_tokens, self._ds_input_embeds[0].size(0))
+            for idx in range(self._ds_num_level):
+                self._ds_input_embeds[idx][:clear_len].zero_()
+            self._ds_input_embeds_num_tokens = 0
+
     def embed_input_ids(
         self,
         input_ids: torch.Tensor,
@@ -137,43 +207,105 @@ class Qwen3OmniMoeLLMStage(nn.Module):
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             return inputs_embeds
 
-        # # [DEBUG] Stage-2 gather before deepstack split: text embed + multimodal embed stats
-        # logger.info("[DBG_MERGE] Stage-2 text_embed shape=%s mean=%s std=%s",
-        #             inputs_embeds.shape, inputs_embeds.float().mean().item(),
-        #             inputs_embeds.float().std().item())
-        # for i, emb in enumerate(multimodal_embeddings):
-        #     _tag = "visual" if (emb.ndim == 2 and emb.shape[-1] != inputs_embeds.shape[-1]) else "audio"
-        #     logger.info("[DBG_MERGE] Stage-2 mm_before[%d](%s) shape=%s mean=%s std=%s",
-        #                 i, _tag, emb.shape, emb.float().mean().item(), emb.float().std().item())
+        # The native implementation splits visual embeddings in place.
+        # Connector-backed stages may provide a tuple, so normalize it first.
+        multimodal_embeddings = list(multimodal_embeddings)
 
-        # [Decoupled] Split deepstack visual embeddings to match LM hidden_size.
+        # Split and scatter deepstack features exactly as the fused thinker does.
+        # In particular, the deepstack tensor must be aligned to the complete
+        # scheduled token sequence; packing visual features at the beginning of
+        # the buffer injects them into text/audio tokens and corrupts the KV cache.
         _text_hidden = self.config.text_config.hidden_size
         _vision_cfg = getattr(self.config, "vision_config", None)
         _ds_idx = getattr(_vision_cfg, "deepstack_visual_indexes", None) if _vision_cfg else None
-        if _ds_idx is not None:
+        is_mm_device = (
+            is_multimodal.to(device=input_ids.device, non_blocking=True)
+            if is_multimodal is not None
+            else None
+        )
+        is_video = (
+            is_mm_device & (input_ids == self.config.video_token_id)
+            if is_mm_device is not None
+            else None
+        )
+        is_audio = (
+            is_mm_device & (input_ids == self.config.audio_token_id)
+            if is_mm_device is not None
+            else None
+        )
+        num_video = int(is_video.sum().item()) if is_video is not None else 0
+        num_audio = int(is_audio.sum().item()) if is_audio is not None else 0
+        is_interleaved = (
+            check_interleaved_audio_video(is_video, is_audio, num_video, num_audio)
+            if is_video is not None and is_audio is not None
+            else False
+        )
+
+        has_vision_embeddings = [
+            emb.ndim == 2 and emb.shape[-1] != _text_hidden
+            for emb in multimodal_embeddings
+        ]
+        if _ds_idx is not None and any(has_vision_embeddings) and is_mm_device is not None:
             _ds_len = len(_ds_idx)
+            _ds_multiscale: list[torch.Tensor] = []
+
+            if is_interleaved:
+                is_vision = is_video.clone()
+            else:
+                is_vision = torch.zeros_like(is_mm_device)
+                mm_positions = torch.nonzero(is_mm_device, as_tuple=True)[0]
+                mm_position_idx = 0
+
             for i, emb in enumerate(multimodal_embeddings):
+                num_tokens = emb.shape[0]
                 if emb.ndim == 2 and emb.shape[-1] != _text_hidden:
                     _vis_dim = emb.shape[-1] // (_ds_len + 1)
-                    multimodal_embeddings[i] = emb[:, :_vis_dim]
-                    # logger.info("[DBG_MERGE] Stage-2 mm_after_split[%d] shape=%s mean=%s std=%s",
-                    #             i, multimodal_embeddings[i].shape,
-                    #             multimodal_embeddings[i].float().mean().item(),
-                    #             multimodal_embeddings[i].float().std().item())
+                    _multi_dim = _vis_dim * _ds_len
+                    _emb_main, _emb_multi = torch.split(emb, [_vis_dim, _multi_dim], dim=-1)
+                    multimodal_embeddings[i] = _emb_main
+                    _ds_multiscale.append(_emb_multi)
+                    if not is_interleaved:
+                        current_positions = mm_positions[
+                            mm_position_idx : mm_position_idx + num_tokens
+                        ]
+                        is_vision[current_positions] = True
+                elif not is_interleaved:
+                    current_positions = mm_positions[
+                        mm_position_idx : mm_position_idx + num_tokens
+                    ]
+                    is_vision[current_positions] = False
 
-        # # [DEBUG] Log per-modality token positions
-        # _at = getattr(self.config, "audio_token_id", None)
-        # _vt = getattr(self.config, "video_token_id", None)
-        # _it = getattr(self.config, "image_token_id", None)
-        # for _tid, _nm in [(_vt, "video"), (_at, "audio"), (_it, "image")]:
-        #     if _tid is None:
-        #         continue
-        #     _m = input_ids == _tid
-        #     if _m.any():
-        #         _pos = _m.nonzero(as_tuple=False).squeeze(-1).tolist()
-        #         if isinstance(_pos, list) and _pos:
-        #             logger.info("[POS_MAP] Stage-2 %s token_positions=[%d..%d] count=%d",
-        #                         _nm, _pos[0], _pos[-1], len(_pos))
+                if not is_interleaved:
+                    mm_position_idx += num_tokens
+
+            if _ds_multiscale:
+                deepstack_input_embeds = inputs_embeds.new_zeros(
+                    inputs_embeds.size(0), _ds_len * inputs_embeds.size(1)
+                )
+                deepstack_input_embeds = _merge_multimodal_embeddings(
+                    inputs_embeds=deepstack_input_embeds,
+                    multimodal_embeddings=_ds_multiscale,
+                    is_multimodal=is_vision,
+                )
+                deepstack_input_embeds = (
+                    deepstack_input_embeds.view(
+                        inputs_embeds.shape[0], _ds_len, _vis_dim
+                    )
+                    .permute(1, 0, 2)
+                    .contiguous()
+                )
+                self._ds_set_input_embeds(deepstack_input_embeds)
+
+        if is_interleaved:
+            return merge_interleaved_embeddings(
+                inputs_embeds,
+                multimodal_embeddings,
+                is_video,
+                is_audio,
+                is_mm_device,
+                num_video,
+                num_audio,
+            )
 
         if is_multimodal is not None:
             try:
@@ -189,24 +321,6 @@ class Qwen3OmniMoeLLMStage(nn.Module):
                     exc_info=True,
                 )
                 _result = None
-            # # [DEBUG] Log per-token embedding stats for the full merged sequence
-            # else:
-            #     _tok_id_map = {}
-            #     _at = getattr(self.config, "audio_token_id", None)
-            #     _vt = getattr(self.config, "video_token_id", None)
-            #     _it = getattr(self.config, "image_token_id", None)
-            #     for _tid, _nm in [(_vt, "V"), (_at, "A"), (_it, "I")]:
-            #         if _tid is not None:
-            #             _m = input_ids == _tid
-            #             if _m.any():
-            #                 _tok_id_map[_tid] = _nm
-            #     for _pos in range(_result.shape[0]):
-            #         _tok = input_ids[_pos].item()
-            #         _tag = _tok_id_map.get(_tok, "T")
-            #         _v = _result[_pos].float()
-            #         logger.info("[EMB_DBG] Stage-2 pos=%5d tag=%s tok=%6d mean=%9.6f std=%9.6f min=%9.6f max=%9.6f",
-            #                     _pos, _tag, _tok, _v.mean().item(), _v.std().item(),
-            #                     _v.min().item(), _v.max().item())
             if _result is not None:
                 return _result
 
@@ -225,21 +339,6 @@ class Qwen3OmniMoeLLMStage(nn.Module):
             if num_avail > 0:
                 inputs_embeds[mm_indices[:num_avail]] = emb_flat[:num_avail]
 
-        # # [DEBUG] Log per-token stats for the full sequence (fallback path)
-        # _tok_id_map = {}
-        # for _tid, _nm in [(_vt, "V"), (_at, "A"), (_it, "I")]:
-        #     if _tid is not None:
-        #         _m = input_ids == _tid
-        #         if _m.any():
-        #             _tok_id_map[_tid] = _nm
-        # for _pos in range(inputs_embeds.shape[0]):
-        #     _tok = input_ids[_pos].item()
-        #     _tag = _tok_id_map.get(_tok, "T")
-        #     _v = inputs_embeds[_pos].float()
-        #     logger.info("[EMB_DBG] Stage-2 pos=%5d tag=%s tok=%6d mean=%9.6f std=%9.6f min=%9.6f max=%9.6f",
-        #                 _pos, _tag, _tok, _v.mean().item(), _v.std().item(),
-        #                 _v.min().item(), _v.max().item())
-
         return inputs_embeds
 
     def forward(
@@ -255,12 +354,15 @@ class Qwen3OmniMoeLLMStage(nn.Module):
         Captures layer 0 and accept_hidden_layer for talker conditioning.
         """
         with nvtx_range(f"omni_decoupled_forward_thinker_llm"):
-            capture_kwargs = {}
+            capture_kwargs: dict[str, Any] = {}
             if self._accept_hidden_layer is not None:
                 capture_kwargs = {
                     "capture_layer_indices": [0, int(self._accept_hidden_layer)],
                     "return_hidden_states": True,
                 }
+            ds_input = self._ds_get_input_embeds(inputs_embeds.size(0)) if inputs_embeds is not None else None
+            if ds_input is not None:
+                capture_kwargs["deepstack_input_embeds"] = ds_input
 
             hidden_states, captured_hidden_states = self.language_model.model(
                 input_ids,
@@ -269,6 +371,9 @@ class Qwen3OmniMoeLLMStage(nn.Module):
                 inputs_embeds=inputs_embeds,
                 **capture_kwargs,
             )
+
+            if inputs_embeds is not None:
+                self._ds_clear(inputs_embeds.size(0))
 
             return hidden_states, captured_hidden_states
 
@@ -379,7 +484,8 @@ class Qwen3OmniMoeLLMStage(nn.Module):
 
         llm_pos_ids = np.concatenate(llm_pos_ids_list, axis=1)
         llm_pos_ids = torch.from_numpy(llm_pos_ids)
-        return llm_pos_ids, 0
+        mrope_position_delta = int(llm_pos_ids.max()) + 1 - seq_len
+        return llm_pos_ids, mrope_position_delta
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load only language model weights from the checkpoint.
