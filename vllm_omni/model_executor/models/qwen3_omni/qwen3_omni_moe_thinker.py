@@ -200,38 +200,6 @@ class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
         rotary_pos_emb_sin = rotary_pos_emb_sin.to(hidden_states.device)
         max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
 
-        # Ensure max_seqlen is safe to access on CPU before downstream code
-        # calls `.item()` or performs host-side operations. If it's a CUDA
-        # tensor and accessing it triggers a CUDA illegal memory access,
-        # fall back to a CPU copy or None to avoid crashing the worker.
-        # if max_seqlen is not None and isinstance(max_seqlen, torch.Tensor):
-        #     try:
-        #         device = max_seqlen.device
-        #     except Exception:
-        #         device = None
-
-        #     if device is not None and device.type == "cuda":
-        #         try:
-        #             # Try to move to CPU safely. This may still raise a
-        #             # torch.AcceleratorError if the CUDA kernel previously
-        #             # failed; catch and degrade gracefully.
-        #             max_seqlen = max_seqlen.detach().cpu()
-        #         except torch.AcceleratorError as e:
-        #             logger.debug(
-        #                 "CUDA accelerator error when accessing max_seqlen: %s. "
-        #                 "Falling back to None to avoid illegal memory access.",
-        #                 e,
-        #             )
-        #             max_seqlen = None
-        #         except RuntimeError as e:
-        #             logger.debug(
-        #                 "Runtime error when moving max_seqlen from %s to CPU: %s. "
-        #                 "Falling back to None.",
-        #                 device,
-        #                 e,
-        #             )
-        #             max_seqlen = None
-
         grid_thw_np = grid_thw_tensor.cpu().numpy().astype(np.int32)
         cu_seqlens_np = np.repeat(grid_thw_np[:, 1] * grid_thw_np[:, 2], grid_thw_np[:, 0]).cumsum(
             axis=0, dtype=np.int32
@@ -499,50 +467,7 @@ class Qwen3OmniMoeAudioEncoder(_Qwen3OmniMoeAudioEncoder):
                 cu_chunk_lens.append(remainder)
         cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
 
-        # logger.debug("cu_seqlens.device = %s", cu_seqlens.device)
         max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
-        # logger.debug("max_seqlen.device = %s", max_seqlen.device if isinstance(max_seqlen, torch.Tensor) else None)
-        # # Always emit logging about max_seqlen so we can diagnose device
-        # # placement and access issues (including CUDA illegal memory
-        # # access). Keep inspections minimal to avoid triggering device
-        # # side errors; only query attributes that are unlikely to run
-        # # kernels. If the tensor is on CUDA, attempt a safe CPU copy and
-        # # log success/failure.
-        # try:
-        #     if isinstance(max_seqlen, torch.Tensor):
-        #         try:
-        #             dev = getattr(max_seqlen, "device", None)
-        #             dt = getattr(max_seqlen, "dtype", None)
-        #             ne = max_seqlen.numel()
-        #             logger.debug(
-        #                 "max_seqlen: tensor device=%s dtype=%s numel=%s",
-        #                 dev,
-        #                 dt,
-        #                 ne,
-        #             )
-        #         except Exception as e:
-        #             logger.debug("max_seqlen: tensor (inspection failed: %s)", e)
-        #     else:
-        #         logger.debug("max_seqlen: %r", max_seqlen)
-        # except Exception as e:
-        #     logger.warning("Unexpected error while logging max_seqlen: %s", e)
-
-        # # Perform a non-invasive device check. Do NOT modify or move the
-        # # tensor here — only log device/dtype info. Moving to CPU would
-        # # require moving it back later; to avoid data mutation, we only
-        # # warn if the tensor lives on CUDA so callers avoid `.item()`.
-        # if isinstance(max_seqlen, torch.Tensor):
-        #     dev = getattr(max_seqlen, "device", None)
-        #     if dev is not None and getattr(dev, "type", None) == "cuda":
-        #         logger.debug(
-        #             "max_seqlen is on CUDA device=%s dtype=%s numel=%s; "
-        #             "avoid calling .item() directly to prevent illegal memory access.",
-        #             dev,
-        #             getattr(max_seqlen, "dtype", None),
-        #             max_seqlen.numel(),
-        #         )
-        #     else:
-        #         logger.debug("max_seqlen device=%s dtype=%s numel=%s", dev, getattr(max_seqlen, "dtype", None), max_seqlen.numel())
 
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(
@@ -1136,8 +1061,7 @@ class Qwen3OmniMoeConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMix
         )
         audio_features = audio_outputs if isinstance(audio_outputs, torch.Tensor) else audio_outputs.last_hidden_state
 
-        chunks = audio_features.split(audio_output_lengths.tolist())
-        return chunks
+        return audio_features.split(audio_output_lengths.tolist())
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1472,7 +1396,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             self._set_deepstack_input_embeds(deepstack_input_embeds)
 
         if is_interleaved:
-            _result = merge_interleaved_embeddings(
+            return merge_interleaved_embeddings(
                 inputs_embeds,
                 multimodal_embeddings,
                 is_video,
@@ -1481,18 +1405,16 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 num_video,
                 num_audio,
             )
-        else:
-            # Default: standard merge (no interleaving), same as parent class.
-            # multimodal_embeddings may have been updated above (deepstack
-            # main-scale). Use super() to stay consistent with the parent
-            # implementation and avoid issues seen in Qwen2.5-Omni (#34506).
-            _result = super().embed_input_ids(
-                input_ids,
-                multimodal_embeddings=multimodal_embeddings,
-                is_multimodal=is_multimodal,
-            )
 
-        return _result
+        # Default: standard merge (no interleaving), same as parent class.
+        # multimodal_embeddings may have been updated above (deepstack
+        # main-scale). Use super() to stay consistent with the parent
+        # implementation and avoid issues seen in Qwen2.5-Omni (#34506).
+        return super().embed_input_ids(
+            input_ids,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
+        )
 
     def forward(
         self,

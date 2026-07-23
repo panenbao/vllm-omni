@@ -89,9 +89,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
         _waiting_ids = [r.request_id for r in self.waiting][:3]
         _running_ids = [r.request_id for r in self.running][:3]
-        if _waiting_ids or _running_ids:
-            logger.info("[GEN_SCHED] schedule() waiting=%s running=%s",
-                        _waiting_ids, _running_ids)
+        # if _waiting_ids or _running_ids:
+        #     logger.info("[GEN_SCHED] schedule() waiting=%s running=%s",
+        #                 _waiting_ids, _running_ids)
 
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
@@ -291,14 +291,14 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
             scheduled_new_reqs.append(request)
-            _has_enc = getattr(request, "has_encoder_inputs", False)
-            try:
-                _mm_len = len(getattr(request, "mm_features", []) or [])
-            except Exception:
-                _mm_len = -1
-            logger.info("[GEN_SCHED] new_req=%s tokens=%d enced=%s mm_features=%d sched_enc=%s",
-                        request.request_id, num_new_tokens, _has_enc, _mm_len,
-                        list(scheduled_encoder_inputs.get(request.request_id, [])))
+            # _has_enc = getattr(request, "has_encoder_inputs", False)
+            # try:
+            #     _mm_len = len(getattr(request, "mm_features", []) or [])
+            # except Exception:
+            #     _mm_len = -1
+            # logger.info("[GEN_SCHED] new_req=%s tokens=%d enced=%s mm_features=%d sched_enc=%s",
+            #             request.request_id, num_new_tokens, _has_enc, _mm_len,
+            #             list(scheduled_encoder_inputs.get(request.request_id, [])))
 
         # Return skipped waiting requests
         if skipped_waiting_requests:

@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -15,6 +17,18 @@ class _DummyInputBatch:
         self.req_id_to_index = {"req-1": 0}
         self.num_reqs = 1
         self.vocab_size = 10
+
+
+class _DummyFeature:
+    def __init__(self, modality, identifier, offset):
+        self.modality = modality
+        self.identifier = identifier
+        self.mm_position = SimpleNamespace(offset=offset)
+
+
+class _DummyRequestState:
+    def __init__(self, mm_features):
+        self.mm_features = mm_features
 
 
 def _make_runner(multimodal_outputs):
@@ -83,3 +97,73 @@ def test_sample_tokens_dict_output():
     assert "audio" in output.pooler_output[0]
     assert "unused" not in output.pooler_output[0]
     assert output.pooler_output[0]["audio"].shape == (1, 4)
+
+
+def test_build_encoder_outputs_preserves_request_and_prompt_order():
+    """Mixed multimodal batches must not use a batch-global modality queue."""
+    runner = object.__new__(GPUGenerationModelRunner)
+    runner.model = SimpleNamespace(model_stage="visual_encoder")
+    runner.input_batch = SimpleNamespace(req_ids=["req-1", "req-2"])
+    runner.requests = {
+        "req-1": _DummyRequestState(
+            [
+                _DummyFeature("video", "video-1", 10),
+                _DummyFeature("audio", "audio-1", 20),
+                _DummyFeature("image", "image-1", 30),
+            ]
+        ),
+        "req-2": _DummyRequestState(
+            [
+                _DummyFeature("audio", "audio-2", 10),
+                _DummyFeature("video", "video-2", 20),
+            ]
+        ),
+    }
+    runner.encoder_cache = {
+        "video-1": torch.tensor([[11.0]]),
+        "image-1": torch.tensor([[12.0]]),
+        "video-2": torch.tensor([[21.0]]),
+    }
+    runner.model_intermediate_buffer = {
+        "req-1": {
+            "embed": {"encoder": [torch.tensor([[13.0]])]},
+            "meta": {"encoder_modalities": ["audio"]},
+        },
+        "req-2": {
+            "embed": {"encoder": [torch.tensor([[22.0]])]},
+            "meta": {"encoder_modalities": ["audio"]},
+        },
+    }
+
+    outputs = GPUGenerationModelRunner._build_decoupled_encoder_outputs(runner)
+
+    assert [output["meta"]["encoder_modalities"] for output in outputs] == [
+        ["video", "audio", "image"],
+        ["audio", "video"],
+    ]
+    assert [item.item() for item in outputs[0]["embed"]["encoder"]] == [11.0, 13.0, 12.0]
+    assert [item.item() for item in outputs[1]["embed"]["encoder"]] == [22.0, 21.0]
+
+
+def test_build_encoder_outputs_handles_multiple_items_in_one_request():
+    runner = object.__new__(GPUGenerationModelRunner)
+    runner.model = SimpleNamespace(model_stage="audio_encoder")
+    runner.input_batch = SimpleNamespace(req_ids=["req-1"])
+    runner.requests = {
+        "req-1": _DummyRequestState(
+            [
+                _DummyFeature("audio", "audio-2", 20),
+                _DummyFeature("audio", "audio-1", 10),
+            ]
+        )
+    }
+    runner.encoder_cache = {
+        "audio-1": torch.tensor([[1.0]]),
+        "audio-2": torch.tensor([[2.0]]),
+    }
+    runner.model_intermediate_buffer = {}
+
+    outputs = GPUGenerationModelRunner._build_decoupled_encoder_outputs(runner)
+
+    assert outputs[0]["meta"]["encoder_modalities"] == ["audio", "audio"]
+    assert [item.item() for item in outputs[0]["embed"]["encoder"]] == [1.0, 2.0]

@@ -9,6 +9,7 @@ from __future__ import annotations
 import gc
 import logging
 from dataclasses import replace
+from typing import Any
 
 import numpy as np
 import torch
@@ -97,6 +98,101 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             if self.uses_mrope:
                 self._init_mrope_positions(req_state)
+
+    @staticmethod
+    def _encoder_payload_items(payload: Any) -> tuple[list[torch.Tensor], list[str]]:
+        """Extract the typed encoder items from a request-local payload."""
+        if not isinstance(payload, dict):
+            return [], []
+        embed = payload.get("embed", {})
+        meta = payload.get("meta", {})
+        items = embed.get("encoder") if isinstance(embed, dict) else None
+        modalities = meta.get("encoder_modalities") if isinstance(meta, dict) else None
+        if items is None:
+            items = payload.get("embed.encoder")
+        if modalities is None:
+            modalities = payload.get("meta.encoder_modalities")
+        if isinstance(items, torch.Tensor):
+            items = [items]
+        if not isinstance(items, list) or not isinstance(modalities, list):
+            return [], []
+        if len(items) != len(modalities) or not all(isinstance(item, torch.Tensor) for item in items):
+            return [], []
+        return items, [str(modality) for modality in modalities]
+
+    def _build_decoupled_encoder_outputs(self) -> list[dict[str, Any]]:
+        """Build one encoder payload per request from the encoder cache.
+
+        The multimodal encoder execution path already associates each encoded
+        item with its ``mm_feature.identifier`` in ``self.encoder_cache``.  Do
+        not reconstruct request ownership from a batch-global output list:
+        prompts may interleave modalities and the encoder stage may process
+        multiple requests in one forward.
+        """
+        model_stage = getattr(self.model, "model_stage", None)
+        if model_stage not in {"audio_encoder", "visual_encoder"}:
+            raise RuntimeError(f"Unsupported decoupled encoder stage: {model_stage!r}")
+
+        encoder_outputs: list[dict[str, Any]] = []
+        for req_id in self.input_batch.req_ids:
+            req_state = self.requests.get(req_id)
+            features = sorted(
+                getattr(req_state, "mm_features", None) or [],
+                key=lambda feature: feature.mm_position.offset,
+            )
+
+            # Stage 1 carries the already encoded audio items from stage 0.
+            upstream_items, upstream_modalities = self._encoder_payload_items(
+                self.model_intermediate_buffer.get(req_id, {})
+            )
+            upstream_by_modality: dict[str, list[torch.Tensor]] = {}
+            for modality, item in zip(upstream_modalities, upstream_items, strict=True):
+                upstream_by_modality.setdefault(modality, []).append(item)
+
+            request_items: list[torch.Tensor] = []
+            request_modalities: list[str] = []
+            for feature in features:
+                modality = feature.modality
+                if model_stage == "audio_encoder":
+                    if modality != "audio":
+                        continue
+                    embedding = self.encoder_cache.get(feature.identifier)
+                elif modality == "audio":
+                    queue = upstream_by_modality.get("audio", [])
+                    embedding = queue.pop(0) if queue else None
+                elif modality in {"image", "video"}:
+                    embedding = self.encoder_cache.get(feature.identifier)
+                else:
+                    continue
+
+                if not isinstance(embedding, torch.Tensor):
+                    raise ValueError(
+                        f"Missing {modality} encoder embedding for request {req_id}: "
+                        f"identifier={feature.identifier}"
+                    )
+                request_items.append(embedding)
+                request_modalities.append(modality)
+
+            if model_stage == "visual_encoder" and upstream_by_modality.get("audio"):
+                raise ValueError(f"Unused upstream audio encoder embeddings for request {req_id}")
+
+            encoder_outputs.append(
+                {
+                    "embed": {"encoder": request_items},
+                    "meta": {"encoder_modalities": request_modalities},
+                }
+            )
+        return encoder_outputs
+
+    @staticmethod
+    def _to_cpu_payload(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.detach().to("cpu").contiguous()
+        if isinstance(value, dict):
+            return {key: GPUGenerationModelRunner._to_cpu_payload(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [GPUGenerationModelRunner._to_cpu_payload(item) for item in value]
+        return value
 
     @torch.inference_mode()
     def execute_model(
@@ -352,6 +448,12 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             )
 
         _, multimodal_outputs = self.extract_multimodal_outputs(outputs)
+        model_stage = getattr(getattr(self, "model", None), "model_stage", None)
+        if model_stage in {"audio_encoder", "visual_encoder"}:
+            # Encoder outputs are assembled from the request-keyed encoder
+            # cache.  The encoder model forward itself is intentionally not
+            # used as a batch-global payload carrier.
+            multimodal_outputs = self._build_decoupled_encoder_outputs()
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             None,
@@ -420,7 +522,14 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             self.finalize_kv_connector()
 
         pooler_output: list[object] = []
-        if isinstance(multimodal_outputs, torch.Tensor):
+        if (
+            getattr(getattr(self, "model", None), "model_stage", None)
+            in {"audio_encoder", "visual_encoder"}
+            and isinstance(multimodal_outputs, list)
+            and all(isinstance(output, dict) for output in multimodal_outputs)
+        ):
+            pooler_output = [self._to_cpu_payload(output) for output in multimodal_outputs]
+        elif isinstance(multimodal_outputs, torch.Tensor):
             assert multimodal_outputs.shape[0] == 1, (
                 "model should return a single tensor, to return multiple tensors, use a dict"
             )

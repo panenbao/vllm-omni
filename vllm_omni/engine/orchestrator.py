@@ -102,10 +102,10 @@ def build_engine_core_request_from_tokens(
         prompt.get("additional_information"),
         log_prefix=f"build_engine_core_request_from_tokens req={request_id}",
     )
-    if prompt.get("additional_information") is not None:
-        logger.info("[BUILD_REQ] req=%s additional_info keys=%s payload_none=%s",
-                    request_id, list(prompt["additional_information"].keys()),
-                    additional_info_payload is None)
+    # if prompt.get("additional_information") is not None:
+    #     logger.info("[BUILD_REQ] req=%s additional_info keys=%s payload_none=%s",
+    #                 request_id, list(prompt["additional_information"].keys()),
+    #                 additional_info_payload is None)
 
     return OmniEngineCoreRequest(
         request_id=request_id,
@@ -465,17 +465,17 @@ class Orchestrator:
             final_stage_id = msg.final_stage_id
             final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
 
-            logger.debug(
-                "[Orchestrator] _handle_add_request: stage=%s req=%s "
-                "prompt_type=%s original_prompt_type=%s final_stage=%s "
-                "num_sampling_params=%d",
-                stage_id,
-                request_id,
-                type(prompt).__name__,
-                type(original_prompt).__name__,
-                final_stage_id,
-                len(sampling_params_list),
-            )
+            # logger.debug(
+            #     "[Orchestrator] _handle_add_request: stage=%s req=%s "
+            #     "prompt_type=%s original_prompt_type=%s final_stage=%s "
+            #     "num_sampling_params=%d",
+            #     stage_id,
+            #     request_id,
+            #     type(prompt).__name__,
+            #     type(original_prompt).__name__,
+            #     final_stage_id,
+            #     len(sampling_params_list),
+            # )
 
             req_state = OrchestratorRequestState(
                 request_id=request_id,
@@ -795,12 +795,12 @@ class Orchestrator:
             req_state = self.request_states.get(output.request_id)
 
             # ==== DEBUG: orchestrator 收到 stage 输出 ====
-            _mm = getattr(output, "multimodal_output", None)
-            logger.info("[ORCH_OUT] stage=%s replica=%s req=%s finished=%s "
-                        "final_output=%s async_chunk=%s multimodal=%s",
-                        stage_id, replica_id, output.request_id, output.finished,
-                        pool.final_output, self.async_chunk,
-                        list(_mm.keys()) if isinstance(_mm, dict) else type(_mm).__name__ if _mm is not None else None)
+            # _mm = getattr(output, "multimodal_output", None)
+            # logger.info("[ORCH_OUT] stage=%s replica=%s req=%s finished=%s "
+            #             "final_output=%s async_chunk=%s multimodal=%s",
+            #             stage_id, replica_id, output.request_id, output.finished,
+            #             pool.final_output, self.async_chunk,
+            #             list(_mm.keys()) if isinstance(_mm, dict) else type(_mm).__name__ if _mm is not None else None)
             if req_state is None:
                 logger.warning(
                     "[Orchestrator] Dropping output for unknown req %s at stage-%s (known reqs: %s)",
@@ -964,9 +964,9 @@ class Orchestrator:
         # Async-chunk streaming (2→3→4) uses connector-based transfer.
         _orchestrator_forwards = not self.async_chunk or stage_id <= 1
         _next_submitted = self._next_stage_already_submitted(stage_id, req_state)
-        logger.info("[ROUTE] stage=%s req=%s finished=%s final_stage=%s orch_fwd=%s next_submitted=%s stream=%s",
-                    stage_id, req_id, finished, req_state.final_stage_id,
-                    _orchestrator_forwards, _next_submitted, req_state.streaming.enabled)
+        # logger.info("[ROUTE] stage=%s req=%s finished=%s final_stage=%s orch_fwd=%s next_submitted=%s stream=%s",
+        #             stage_id, req_id, finished, req_state.final_stage_id,
+        #             _orchestrator_forwards, _next_submitted, req_state.streaming.enabled)
         # Encoder stages (0→1) always forward (via submit_update when prewarmed).
         if (
             (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
@@ -1338,18 +1338,18 @@ class Orchestrator:
             # Downstream (talker/code2wav) must NOT see them (avoids encoder-cache misses).
             model_stage = getattr(next_client, "model_stage", None)
             mm_features = req_state.mm_features if model_stage and model_stage.startswith(("thinker", "visual_", "audio_")) else None
-            logger.info("[FWD] stage=%s->%s model_stage=%s mm_features=%s",
-                        src_stage_id, next_logical, model_stage,
-                        len(mm_features) if mm_features else None)
+            # logger.info("[FWD] stage=%s->%s model_stage=%s mm_features=%s",
+            #             src_stage_id, next_logical, model_stage,
+            #             len(mm_features) if mm_features else None)
             # ==== DEBUG: next_input 内容 ====
-            _add_info = (next_input.get("additional_information") if isinstance(next_input, dict)
-                         else getattr(next_input, "additional_information", None))
-            _pt_ids = (next_input.get("prompt_token_ids") if isinstance(next_input, dict)
-                       else getattr(next_input, "prompt_token_ids", None))
-            logger.info("[FWD_DATA] stage=%s->%s req=%s pt_len=%s add_info_keys=%s",
-                        src_stage_id, next_logical, req_id,
-                        len(_pt_ids) if _pt_ids else 0,
-                        list(_add_info.keys()) if isinstance(_add_info, dict) else str(type(_add_info).__name__))
+            # _add_info = (next_input.get("additional_information") if isinstance(next_input, dict)
+            #              else getattr(next_input, "additional_information", None))
+            # _pt_ids = (next_input.get("prompt_token_ids") if isinstance(next_input, dict)
+            #            else getattr(next_input, "prompt_token_ids", None))
+            # logger.info("[FWD_DATA] stage=%s->%s req=%s pt_len=%s add_info_keys=%s",
+            #             src_stage_id, next_logical, req_id,
+            #             len(_pt_ids) if _pt_ids else 0,
+            #             list(_add_info.keys()) if isinstance(_add_info, dict) else str(type(_add_info).__name__))
 
             request = build_engine_core_request_from_tokens(
                 request_id=req_id,
@@ -1362,15 +1362,15 @@ class Orchestrator:
 
             request.external_req_id = request.request_id
             if already_submitted:
-                logger.info("[FWD] submit_update stage=%s->%s req=%s",
-                            src_stage_id, next_logical, req_id)
+                # logger.info("[FWD] submit_update stage=%s->%s req=%s",
+                #             src_stage_id, next_logical, req_id)
                 await next_pool.submit_update(req_id, req_state, request)
             else:
-                logger.info("[FWD] submit_initial stage=%s->%s req=%s",
-                            src_stage_id, next_logical, req_id)
+                # logger.info("[FWD] submit_initial stage=%s->%s req=%s",
+                #             src_stage_id, next_logical, req_id)
                 await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
-            logger.info("[FWD] submit done stage=%s->%s req=%s",
-                        src_stage_id, next_logical, req_id)
+            # logger.info("[FWD] submit done stage=%s->%s req=%s",
+            #             src_stage_id, next_logical, req_id)
 
         req_state.stage_submit_ts[next_logical] = _time.time()
         _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0

@@ -613,21 +613,6 @@ class OmniConnectorModelRunnerMixin:
     def _apply_staged_payloads_locked(self, staged_payloads: dict[str, Any]) -> None:
         for req_id, payload in staged_payloads.items():
             self._local_stage_payload_cache[req_id] = self._snapshot_payload(payload)
-            # # [DEBUG] Receive-side: log encoder payload stats
-            # _stage_id = getattr(self, "_stage_id", "?")
-            # try:
-            #     _embed = payload.get("embed", {}) if isinstance(payload, dict) else {}
-            #     _meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
-            #     _items = _embed.get("encoder", []) if isinstance(_embed, dict) else []
-            #     _labels = _meta.get("encoder_modalities", []) if isinstance(_meta, dict) else []
-            #     if _items and _labels and len(_items) == len(_labels):
-            #         for _i, (_emb, _mod) in enumerate(zip(_items, _labels)):
-            #             if isinstance(_emb, torch.Tensor):
-            #                 logger.info("[DBG_RECV] Stage-%s recv %s[%d] shape=%s mean=%s std=%s",
-            #                             _stage_id, _mod, _i, _emb.shape,
-            #                             _emb.float().mean().item(), _emb.float().std().item())
-            # except Exception as _e:
-            #     logger.debug("[DBG_RECV] Stage-%s log error: %s", _stage_id, _e)
 
     def _collect_full_payload_results_locked(self) -> dict[str, Any] | None:
         if not self._full_payload_pending_broadcast_req_ids:
@@ -967,13 +952,13 @@ class OmniConnectorModelRunnerMixin:
         if self._omni_connector is None:
             logger.info("[Stage-%s] send_full_payload_outputs: connector is None, skip", self._stage_id)
             return []
-        else:
-            logger.info(
-                "[Stage-%s] send_full_payload_outputs: connector=%s, outputs=%s",
-                self._stage_id,
-                type(self._omni_connector).__name__,
-                list(outputs.keys()),
-            )
+        # else:
+        #     logger.info(
+        #         "[Stage-%s] send_full_payload_outputs: connector=%s, outputs=%s",
+        #         self._stage_id,
+        #         type(self._omni_connector).__name__,
+        #         list(outputs.keys()),
+        #     )
         if not self.is_data_transfer_rank():
             logger.info(
                 "[Stage-%s] send_full_payload_outputs: not data_transfer_rank (rank=%s), skip",

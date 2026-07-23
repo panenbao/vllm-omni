@@ -172,7 +172,7 @@ class Qwen3OmniMoeVisualEncoderStage(nn.Module):
 
             encoder_embeddings = upstream_embeddings + visual_embeddings
             encoder_modalities = upstream_modalities + visual_modalities
-            logger.debug("Decoupled visual stage produced %d encoder items", len(encoder_embeddings))
+            # logger.debug("Decoupled visual stage produced %d encoder items", len(encoder_embeddings))
             # # [DEBUG] Stage-1 send: per-modality embed stats
             # for i, (emb, mod) in enumerate(zip(encoder_embeddings, encoder_modalities)):
             #     logger.info("[DBG_SEND] Stage-1 %s[%d] shape=%s mean=%s std=%s",

@@ -33,6 +33,7 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.engine.serialization import deserialize_additional_information
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -632,10 +633,10 @@ class OmniGPUModelRunner(GPUModelRunner):
                             "additional_information_cpu",
                             info_dict,
                         )
-                        logger.info("[ADDINFO] req=%s additional_information keys=%s has_encoder_emb=%s type=%s",
-                                    req_id, list(info_dict.keys()),
-                                    "encoder_embeddings" in info_dict,
-                                    type(info_dict.get("encoder_embeddings")).__name__ if info_dict.get("encoder_embeddings") else "N/A")
+                        # logger.info("[ADDINFO] req=%s additional_information keys=%s has_encoder_emb=%s type=%s",
+                        #             req_id, list(info_dict.keys()),
+                        #             "encoder_embeddings" in info_dict,
+                        #             type(info_dict.get("encoder_embeddings")).__name__ if info_dict.get("encoder_embeddings") else "N/A")
             except Exception as e:
                 logger.error(f"Error decoding additional information: {e}")
 
@@ -1464,33 +1465,28 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self.inputs_embeds.gpu[start_offset : start_offset + overlay_len].copy_(src)
 
     def _update_additional_information(self, scheduler_output: "SchedulerOutput") -> None:
-        from vllm_omni.engine.serialization import deserialize_additional_information
 
         for new_req in scheduler_output.scheduled_new_reqs:
             payload_info = getattr(new_req, "additional_information", None)
-            logger.info("[ADDINFO_RAW] req=%s payload=%s type=%s",
-                        new_req.req_id, payload_info is not None, type(payload_info).__name__)
+            # logger.info("[ADDINFO_RAW] req=%s payload=%s type=%s",
+            #             new_req.req_id, payload_info is not None, type(payload_info).__name__)
             if isinstance(payload_info, dict):
                 logger.warning_once(
                     "additional_information on request data is deprecated, use model_intermediate_buffer"
                 )
                 self._update_intermediate_buffer(new_req.req_id, payload_info)
             elif payload_info is not None:
-                logger.info("[ADDINFO_RAW] req=%s payload_type=%s entries=%s",
-                            new_req.req_id, type(payload_info).__name__,
-                            len(payload_info.entries) if hasattr(payload_info, 'entries') else '?')
+                # logger.info("[ADDINFO_RAW] req=%s payload_type=%s entries=%s",
+                #             new_req.req_id, type(payload_info).__name__,
+                #             len(payload_info.entries) if hasattr(payload_info, 'entries') else '?')
                 try:
                     info_dict = deserialize_additional_information(payload_info)
                 except Exception as e:
                     logger.error("[ADDINFO_RAW] deserialize FAILED for req=%s: %s", new_req.req_id, e)
                     continue
                 if info_dict:
-                    logger.info("[ADDINFO_RAW] req=%s deserialized keys=%s", new_req.req_id, list(info_dict.keys()))
+                    # logger.info("[ADDINFO_RAW] req=%s deserialized keys=%s", new_req.req_id, list(info_dict.keys()))
                     self._update_intermediate_buffer(new_req.req_id, info_dict)
-                else:
-                    logger.info("[ADDINFO_RAW] req=%s info_dict empty", new_req.req_id)
-            else:
-                logger.info("[ADDINFO_RAW] req=%s additional_information is None", new_req.req_id)
 
         if hasattr(scheduler_output.scheduled_cached_reqs, "additional_information"):
             logger.warning_once(
@@ -1829,15 +1825,16 @@ class OmniGPUModelRunner(GPUModelRunner):
                 **self._extract_mm_kwargs(scheduler_output),
             }
 
-            # [Decoupled encoder] forward raw multimodal data to model.forward.
-            # Encoder stages (audio_encoder, visual_encoder) lack
-            # _cached_encoder_embeddings so _has_cache is False here.  The parent's
-            # _extract_mm_kwargs is gated by is_multimodal_raw_input_only_model
-            # which is False for the decoupled model, so we must inject the raw
-            # inputs (input_audio_features, pixel_values, …) into model_kwargs
-            # manually.  Without this the encoder's forward → embed_multimodal()
-            # receives empty kwargs and produces no output.
-            if not _has_cache:
+            # Keep the legacy raw-input fallback for non-decoupled models.  The
+            # decoupled audio/visual stages execute their scheduled multimodal
+            # inputs through _execute_mm_encoder(), which fills encoder_cache by
+            # item identifier.  Reconstructing a batch-wide kwargs dict here
+            # would merge repeated modalities from different requests and lose
+            # item ownership before the stage payload is built.
+            if not _has_cache and getattr(self.model, "model_stage", None) not in {
+                "audio_encoder",
+                "visual_encoder",
+            }:
                 _raw_items: list[tuple[str, Any]] = []
                 for _req_id in self.input_batch.req_ids:
                     _req_state = self.requests.get(_req_id)

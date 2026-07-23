@@ -678,19 +678,19 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            # ==== DEBUG: _model_forward 输入输出 ====
-            import json, os
-            _step = self.__dict__.setdefault("_fwd_step", 0) + 1
-            self._fwd_step = _step
-            _dbg_dir = f"/home/MotivationExperiment/logs/debug_cmp_naive/{os.getpid()}"
-            _fwd = {
-                "step": _step,
-                "input_ids_shape": list(input_ids.shape) if input_ids is not None else None,
-                "input_ids_preview": input_ids[:20].tolist() if input_ids is not None else None,
-                "inputs_embeds_shape": list(inputs_embeds.shape) if inputs_embeds is not None else None,
-                "positions_shape": list(positions.shape) if positions is not None else None,
-                "model_stage": getattr(getattr(self, "model", None), "model_stage", None),
-            }
+            # # ==== DEBUG: _model_forward 输入输出 ====
+            # import json, os
+            # _step = self.__dict__.setdefault("_fwd_step", 0) + 1
+            # self._fwd_step = _step
+            # _dbg_dir = f"/home/MotivationExperiment/logs/debug_cmp_naive/{os.getpid()}"
+            # _fwd = {
+            #     "step": _step,
+            #     "input_ids_shape": list(input_ids.shape) if input_ids is not None else None,
+            #     "input_ids_preview": input_ids[:20].tolist() if input_ids is not None else None,
+            #     "inputs_embeds_shape": list(inputs_embeds.shape) if inputs_embeds is not None else None,
+            #     "positions_shape": list(positions.shape) if positions is not None else None,
+            #     "model_stage": getattr(getattr(self, "model", None), "model_stage", None),
+            # }
 
             model_output = self._model_forward(
                 input_ids=input_ids,
@@ -703,20 +703,20 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 sampler=self.sampler,
             )
 
-            # ==== DEBUG: 输出 ====
-            _hs = model_output[0] if isinstance(model_output, tuple) else model_output
-            if isinstance(_hs, torch.Tensor):
-                _hs_cpu = _hs.detach().cpu().float()
-                _fwd["hidden_states_shape"] = list(_hs.shape)
-                _fwd["hidden_states_mean"] = _hs_cpu.mean().item()
-                _fwd["hidden_states_std"] = _hs_cpu.std().item()
-            _fwd["output_type"] = type(model_output).__name__
-            if isinstance(model_output, tuple):
-                _fwd["captured_keys"] = (list(model_output[1].keys()) if isinstance(model_output[1], dict)
-                                          else type(model_output[1]).__name__)
-            os.makedirs(_dbg_dir, exist_ok=True)
-            with open(f"{_dbg_dir}/step_{_step:04d}.json", "w") as f:
-                json.dump(_fwd, f, indent=2, default=str)
+            # # ==== DEBUG: 输出 ====
+            # _hs = model_output[0] if isinstance(model_output, tuple) else model_output
+            # if isinstance(_hs, torch.Tensor):
+            #     _hs_cpu = _hs.detach().cpu().float()
+            #     _fwd["hidden_states_shape"] = list(_hs.shape)
+            #     _fwd["hidden_states_mean"] = _hs_cpu.mean().item()
+            #     _fwd["hidden_states_std"] = _hs_cpu.std().item()
+            # _fwd["output_type"] = type(model_output).__name__
+            # if isinstance(model_output, tuple):
+            #     _fwd["captured_keys"] = (list(model_output[1].keys()) if isinstance(model_output[1], dict)
+            #                               else type(model_output[1]).__name__)
+            # os.makedirs(_dbg_dir, exist_ok=True)
+            # with open(f"{_dbg_dir}/step_{_step:04d}.json", "w") as f:
+            #     json.dump(_fwd, f, indent=2, default=str)
 
             # [Omni] Map pending ropes metadata to req_ids.
             if hasattr(self.model, "flush_pending_metadata"):
